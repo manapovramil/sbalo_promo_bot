@@ -216,4 +216,15 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     print("SBALO Promo Bot (Webhook) started on port", port)
     print("Expecting Telegram updates at:", WEBHOOK_URL)
+if __name__ == "__main__":
+    try:
+        bot.remove_webhook()
+        bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message","callback_query"])
+        print("Webhook set to:", WEBHOOK_URL)
+    except Exception as e:
+        print("Failed to set webhook:", e)
+
+    port = int(os.getenv("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
+
     app.run(host="0.0.0.0", port=port)
