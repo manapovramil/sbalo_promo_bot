@@ -191,15 +191,39 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"  # полный адрес вебху�
 def health():
     return "OK", 200
 
-@app.before_first_request
-def set_webhook():
+# ---------- FLASK (WEBHOOK) ----------
+app = Flask(__name__)
+
+# Render подставляет внешний хост в RENDER_EXTERNAL_HOSTNAME
+BASE_URL = os.getenv("BASE_URL") or f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME','')}".rstrip("/")
+WEBHOOK_PATH = f"/{BOT_TOKEN}"             # секретный путь
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"  # полный адрес вебхука
+
+@app.route("/", methods=["GET"])
+def health():
+    return "OK", 200
+
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def telegram_webhook():
+    try:
+        json_str = request.get_data().decode("utf-8")
+        update = telebot.types.Update.de_json(json_str)
+        bot.process_new_updates([update])
+    except Exception as e:
+        print("Webhook error:", e)
+    return "OK", 200
+
+if __name__ == "__main__":
     try:
         bot.remove_webhook()
-        # Небольшая задержка иногда полезна; но Render стартует быстро — обойдёмся без sleep
         bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message","callback_query"])
         print("Webhook set to:", WEBHOOK_URL)
     except Exception as e:
         print("Failed to set webhook:", e)
+
+    port = int(os.getenv("PORT", "10000"))
+    print("SBALO Promo Bot (Webhook) started on port", port)
+    app.run(host="0.0.0.0", port=port)
 
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
@@ -225,6 +249,4 @@ if __name__ == "__main__":
         print("Failed to set webhook:", e)
 
     port = int(os.getenv("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
-
     app.run(host="0.0.0.0", port=port)
