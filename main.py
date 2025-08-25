@@ -154,9 +154,9 @@ def check_sub(cb):
         bot.edit_message_text("Спасибо за подписку! Промокод станет доступен позже.", cb.message.chat.id, cb.message.message_id)
         return
     src = USER_SOURCE.get(u.id, "subscribe")
-	code, _ = issue_code(u.id, u.username, source=src)
-	# по желанию можно очистить:
-	# USER_SOURCE.pop(u.id, None)
+code, _ = issue_code(u.id, u.username, source=src)
+# по желанию можно очистить:
+# USER_SOURCE.pop(u.id, None)
 
     bot.edit_message_text(f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
                           cb.message.chat.id, cb.message.message_id, parse_mode="HTML")
@@ -174,7 +174,7 @@ def promo(message):
         bot.reply_to(message, "Спасибо за подписку! Промокод станет доступен позже.")
         return
     src = USER_SOURCE.get(u.id, "promo_cmd")
-	code, _ = issue_code(u.id, u.username, source=src)
+code, _ = issue_code(u.id, u.username, source=src)
     bot.reply_to(message, f"Твой персональный промокод: <b>{code}</b> 🎁", parse_mode="HTML")
 
 @bot.message_handler(commands=["redeem"])
