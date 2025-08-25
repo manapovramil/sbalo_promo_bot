@@ -52,6 +52,8 @@ if first[:len(HEADERS)] != HEADERS:
 
 # ---------- Telegram Bot ----------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+# Ключ: user_id, значение: источник из deep-link (?start=vk)
+USER_SOURCE = {}
 
 def generate_code(n=8):
     return "SBALO-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=n))
@@ -127,6 +129,11 @@ WELCOME = ("Привет! 👋 Это промо-бот <b>SBALO</b>.\n\n"
            
 @bot.message_handler(commands=["start","help"])
 def start(message):
+    # захватываем deep-link payload, если он есть
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        USER_SOURCE[message.from_user.id] = parts[1].strip()[:32].lower()
+    # дальше — как было, твоя клавиатура и приветствие
     kb = telebot.types.InlineKeyboardMarkup()
     kb.add(telebot.types.InlineKeyboardButton("✅ Подписаться", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
     kb.add(telebot.types.InlineKeyboardButton("🔄 Проверить подписку", callback_data="check_sub"))
@@ -146,7 +153,11 @@ def check_sub(cb):
         bot.answer_callback_query(cb.id, "Недостаточный стаж подписки.")
         bot.edit_message_text("Спасибо за подписку! Промокод станет доступен позже.", cb.message.chat.id, cb.message.message_id)
         return
-    code, _ = issue_code(u.id, u.username, source="subscribe")
+    src = USER_SOURCE.get(u.id, "subscribe")
+	code, _ = issue_code(u.id, u.username, source=src)
+	# по желанию можно очистить:
+	# USER_SOURCE.pop(u.id, None)
+
     bot.edit_message_text(f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
                           cb.message.chat.id, cb.message.message_id, parse_mode="HTML")
 
@@ -162,7 +173,8 @@ def promo(message):
     if not can_issue(u.id):
         bot.reply_to(message, "Спасибо за подписку! Промокод станет доступен позже.")
         return
-    code, _ = issue_code(u.id, u.username, source="promo_cmd")
+    src = USER_SOURCE.get(u.id, "promo_cmd")
+	code, _ = issue_code(u.id, u.username, source=src)
     bot.reply_to(message, f"Твой персональный промокод: <b>{code}</b> 🎁", parse_mode="HTML")
 
 @bot.message_handler(commands=["redeem"])
