@@ -142,39 +142,60 @@ def start(message):
 @bot.callback_query_handler(func=lambda c: c.data == "check_sub")
 def check_sub(cb):
     u = cb.from_user
+
     if not is_subscribed(u.id):
         kb = telebot.types.InlineKeyboardMarkup()
         kb.add(telebot.types.InlineKeyboardButton("✅ Подписаться", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
         kb.add(telebot.types.InlineKeyboardButton("🔄 Проверить подписку", callback_data="check_sub"))
         bot.answer_callback_query(cb.id, "Вы ещё не подписаны.")
-        bot.edit_message_text(cb.message.text, cb.message.chat.id, cb.message.message_id, reply_markup=kb)
+        bot.edit_message_text(
+            cb.message.text,
+            cb.message.chat.id,
+            cb.message.message_id,
+            reply_markup=kb
+        )
         return
+
     if not can_issue(u.id):
         bot.answer_callback_query(cb.id, "Недостаточный стаж подписки.")
-        bot.edit_message_text("Спасибо за подписку! Промокод станет доступен позже.", cb.message.chat.id, cb.message.message_id)
+        bot.edit_message_text(
+            "Спасибо за подписку! Промокод станет доступен позже.",
+            cb.message.chat.id,
+            cb.message.message_id
+        )
         return
-    src = USER_SOURCE.get(u.id, "subscribe")
-code, _ = issue_code(u.id, u.username, source=src)
-# по желанию можно очистить:
-# USER_SOURCE.pop(u.id, None)
 
-    bot.edit_message_text(f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
-                          cb.message.chat.id, cb.message.message_id, parse_mode="HTML")
+    # источник берём из deep-link (?start=...), если есть
+    src = USER_SOURCE.get(u.id, "subscribe")
+    code, _ = issue_code(u.id, u.username, source=src)
+    bot.edit_message_text(
+        f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
+        cb.message.chat.id,
+        cb.message.message_id,
+        parse_mode="HTML"
+    )
 
 @bot.message_handler(commands=["promo"])
 def promo(message):
     u = message.from_user
+
     if not is_subscribed(u.id):
         kb = telebot.types.InlineKeyboardMarkup()
         kb.add(telebot.types.InlineKeyboardButton("✅ Подписаться", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
         kb.add(telebot.types.InlineKeyboardButton("🔄 Проверить подписку", callback_data="check_sub"))
-        bot.reply_to(message, f"Подпишись на {CHANNEL_USERNAME}, затем нажми «Проверить подписку».", reply_markup=kb)
+        bot.reply_to(
+            message,
+            f"Подпишись на {CHANNEL_USERNAME}, затем нажми «Проверить подписку».",
+            reply_markup=kb
+        )
         return
+
     if not can_issue(u.id):
         bot.reply_to(message, "Спасибо за подписку! Промокод станет доступен позже.")
         return
+
     src = USER_SOURCE.get(u.id, "promo_cmd")
-code, _ = issue_code(u.id, u.username, source=src)
+    code, _ = issue_code(u.id, u.username, source=src)
     bot.reply_to(message, f"Твой персональный промокод: <b>{code}</b> 🎁", parse_mode="HTML")
 
 @bot.message_handler(commands=["redeem"])
