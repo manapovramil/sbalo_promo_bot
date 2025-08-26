@@ -25,6 +25,8 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
 STAFF_IDS = set(int(x) for x in os.getenv("STAFF_IDS", "").split(",") if x.strip().isdigit())
 SUBSCRIPTION_MIN_DAYS = int(os.getenv("SUBSCRIPTION_MIN_DAYS", "0"))
 SERVICE_ACCOUNT_JSON_ENV = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
+DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "7%")
+
 
 if not SERVICE_ACCOUNT_JSON_ENV:
     raise SystemExit("ENV SERVICE_ACCOUNT_JSON пуст — вставьте содержимое credentials.json в переменную окружения.")
@@ -44,11 +46,21 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, SCOPE
 client = gspread.authorize(creds)
 sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 
-HEADERS = ["UserID","Username","PromoCode","DateIssued","DateRedeemed","RedeemedBy","OrderID","Source","SubscribedSince"]
-first = sheet.row_values(1)
-if first[:len(HEADERS)] != HEADERS:
-    sheet.clear()
+HEADERS = ["UserID","Username","PromoCode","DateIssued","DateRedeemed","RedeemedBy","OrderID","Source","SubscribedSince","Discount"]
+
+headers = sheet.row_values(1)
+if not headers:
     sheet.append_row(HEADERS)
+    headers = HEADERS[:]
+else:
+    # Добавляем недостающие колонки справа, не очищая данные
+    changed = False
+    for h in HEADERS:
+        if h not in headers:
+            sheet.update_cell(1, len(headers) + 1, h)
+            headers.append(h)
+            changed = True
+    # никаких sheet.clear() здесь!
 
 # ---------- Telegram Bot ----------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -69,6 +81,14 @@ def find_user_code(user_id):
     if i and rec.get("PromoCode"):
         return i, rec["PromoCode"]
     return None, None
+
+def append_row_dict(data: dict):
+    headers = sheet.row_values(1)
+    row = [""] * len(headers)
+    for k, v in data.items():
+        if k in headers:
+            row[headers.index(k)] = str(v)
+    sheet.append_row(row)
 
 def ensure_subscribed_since(user_id):
     i, rec = get_row_by_user(user_id)
@@ -93,14 +113,26 @@ def can_issue(user_id):
         return True
     since = ensure_subscribed_since(user_id)
     return (datetime.now() - since).days >= SUBSCRIPTION_MIN_DAYS
-
 def issue_code(user_id, username, source="subscribe"):
     _, existing = find_user_code(user_id)
     if existing:
         return existing, False
+
     code = generate_code()
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    sheet.append_row([str(user_id), username or "", code, now, "", "", "", source, ""])
+
+    append_row_dict({
+        "UserID": str(user_id),
+        "Username": username or "",
+        "PromoCode": code,
+        "DateIssued": now,
+        "DateRedeemed": "",
+        "RedeemedBy": "",
+        "OrderID": "",
+        "Source": source,
+        "SubscribedSince": "",
+        "Discount": DISCOUNT_LABEL,       # <-- добавили
+    })
     return code, True
 
 def redeem_code(code, staff_username, order_id=""):
@@ -210,6 +242,67 @@ def redeem(message):
     res = redeem_code(parts[1].strip(), message.from_user.username or "Staff",
                       parts[2].strip() if len(parts) > 2 else "")
     bot.reply_to(message, res)
+
+@bot.message_handler(commands=["verify"])
+def verify_and_redeem(message):
+    # доступ только сотрудникам
+    if STAFF_IDS and message.from_user.id not in STAFF_IDS:
+        bot.reply_to(message, "Команда доступна только сотрудникам.")
+        return
+
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Формат: /verify КОД [НОМЕР_ЗАКАЗА]")
+        return
+
+    code = parts[1].strip()
+    order_id = parts[2].strip() if len(parts) > 2 else ""
+
+    records = sheet.get_all_records()
+    headers = sheet.row_values(1)
+
+    # быстрый доступ к индексам колонок
+    idx = {h: headers.index(h) for h in headers}
+
+    for i, rec in enumerate(records, start=2):  # строки с 2-й
+        if rec.get("PromoCode") == code:
+            # уже погашен?
+            if rec.get("DateRedeemed"):
+                info = (
+                    f"❌ Код уже погашен ранее.\n"
+                    f"Скидка: {rec.get('Discount', '')}\n"
+                    f"Дата выдачи: {rec.get('DateIssued', '')}\n"
+                    f"Дата погашения: {rec.get('DateRedeemed', '')}\n"
+                    f"Погасил: {rec.get('RedeemedBy', '')}\n"
+                    f"Заказ: {rec.get('OrderID', '')}"
+                )
+                bot.reply_to(message, info)
+                return
+
+            # валиден — показываем и тут же помечаем как использованный
+            now = datetime.now().isoformat(sep=" ", timespec="seconds")
+            sheet.update_cell(i, idx["DateRedeemed"] + 1, now)
+            sheet.update_cell(i, idx["RedeemedBy"] + 1, message.from_user.username or "Staff")
+            if order_id:
+                sheet.update_cell(i, idx["OrderID"] + 1, order_id)
+
+            discount = rec.get("Discount", DISCOUNT_LABEL)
+            issued = rec.get("DateIssued", "")
+            source = rec.get("Source", "")
+
+            reply = (
+                "✅ Код действителен и помечен как использованный.\n\n"
+                f"Код: <b>{code}</b>\n"
+                f"Скидка: <b>{discount}</b>\n"
+                f"Выдан: {issued}\n"
+                f"Источник: {source}\n"
+                f"Заказ: {order_id or '—'}\n"
+                f"Сотрудник: @{message.from_user.username if message.from_user.username else 'Staff'}"
+            )
+            bot.reply_to(message, reply, parse_mode="HTML")
+            return
+
+    bot.reply_to(message, "Промокод не найден ❌")
 
 # ---------- FLASK (WEBHOOK) ----------
 app = Flask(__name__)
