@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 SBALO Promo Bot — версия для Render (webhook с fallback на polling)
-Функциональность:
-- Приветствие и "О бренде"
-- Inline: «🎁 Проверить подписку и получить промокод»
-- Промокоды: 4 символа A–Z/0–9, минимум 1 буква; гашение сотрудниками
-- Админ = тоже сотрудник; может добавлять сотрудников
-- Отзывы: рейтинг + текст + до 5 фото (в лист Feedback Google Sheets)
 """
 
 import os, random, string
@@ -25,9 +19,9 @@ CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")  # например: @sbalo
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
 STAFF_IDS: Set[int] = set(int(x) for x in os.getenv("STAFF_IDS", "").split(",") if x.strip().isdigit())
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-SUBSCRIPTION_MIN_DAYS = int(os.getenv("SUBSCRIPTION_MIN_DAYS", "0"))  # дни с момента подписки до выдачи кода
+SUBSCRIPTION_MIN_DAYS = int(os.getenv("SUBSCRIPTION_MIN_DAYS", "0"))
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
-DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "7%")  # отображаемая скидка
+DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "7%")
 
 if not SERVICE_ACCOUNT_JSON:
     raise SystemExit("ENV SERVICE_ACCOUNT_JSON пуст — вставьте содержимое credentials.json в переменную окружения.")
@@ -47,7 +41,7 @@ SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/a
 creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, SCOPES)
 client = gspread.authorize(creds)
 
-# Основной лист (промокоды/подписка)
+# Основной лист
 sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 HEADERS = ["UserID","Username","PromoCode","DateIssued","DateRedeemed","RedeemedBy","OrderID","Source","SubscribedSince","Discount"]
 headers = sheet.row_values(1)
@@ -55,7 +49,6 @@ if not headers:
     sheet.append_row(HEADERS)
     headers = HEADERS[:]
 else:
-    # Досоздадим отсутствующие колонки (на будущее)
     for h in HEADERS:
         if h not in headers:
             sheet.update_cell(1, len(headers) + 1, h)
@@ -71,10 +64,9 @@ except gspread.WorksheetNotFound:
 # ---------- Telegram ----------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# Внутренние состояния и черновики
-STATE: Dict[int, str] = {}               # user_id -> state
-USER_SOURCE: Dict[int, str] = {}         # user_id -> deep-link source
-FEEDBACK_DRAFT: Dict[int, Dict] = {}     # uid -> {"rating": int, "text": str, "photos": [file_id,...]}
+STATE: Dict[int, str] = {}
+USER_SOURCE: Dict[int, str] = {}
+FEEDBACK_DRAFT: Dict[int, Dict] = {}
 
 # ---------- Кнопки ----------
 BTN_ABOUT = "ℹ️ О бренде"
@@ -91,19 +83,17 @@ def is_admin(uid: int) -> bool:
     return bool(ADMIN_ID) and uid == ADMIN_ID
 
 def is_staff(uid: int) -> bool:
-    # админ считается сотрудником
     return uid in STAFF_IDS or is_admin(uid)
 
 def add_staff_id(new_id: int) -> None:
     STAFF_IDS.add(new_id)
-    # Сохраним в окружении для текущего процесса (на Render лучше задать в Settings отдельно)
     os.environ["STAFF_IDS"] = ",".join(str(x) for x in sorted(STAFF_IDS))
 
 # ---------- Клавиатуры ----------
 def make_main_keyboard(user_id: int):
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(telebot.types.KeyboardButton(BTN_ABOUT), telebot.types.KeyboardButton(BTN_FEEDBACK))
-    if is_staff(user_id):  # сотрудники (включая админа) видят кнопку погашения
+    if is_staff(user_id):
         kb.add(telebot.types.KeyboardButton(BTN_STAFF_VERIFY))
     if is_admin(user_id):
         kb.add(telebot.types.KeyboardButton(BTN_ADMIN_ADD_STAFF))
@@ -142,7 +132,7 @@ BRAND_ABOUT = (
     "SBALO — это твой стиль и твой комфорт в каждом шаге."
 )
 
-# ---------- Утилиты Google Sheets ----------
+# ---------- Sheets утилиты ----------
 def append_row_dict(ws, header_list: List[str], data: dict):
     headers_now = ws.row_values(1)
     if not headers_now:
@@ -155,7 +145,6 @@ def append_row_dict(ws, header_list: List[str], data: dict):
     ws.append_row(row)
 
 def get_row_by_user(user_id: int) -> Tuple[int, dict]:
-    """Найти строку по UserID. Возвращает (row_index or None, record or None)."""
     for i, rec in enumerate(sheet.get_all_records(), start=2):
         if str(rec.get("UserID")) == str(user_id):
             return i, rec
@@ -169,7 +158,6 @@ def find_user_code(user_id: int) -> Tuple[int, str]:
 
 # ---------- Промо/подписка ----------
 def generate_short_code() -> str:
-    """4 символа A–Z/0–9, минимум 1 буква."""
     alphabet = string.ascii_uppercase + string.digits
     while True:
         code = "".join(random.choices(alphabet, k=4))
@@ -177,7 +165,6 @@ def generate_short_code() -> str:
             return code
 
 def ensure_subscribed_since(user_id: int) -> datetime:
-    """Заполнить/вернуть дату начала подписки пользователя для логики ожидания."""
     i, rec = get_row_by_user(user_id)
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     headers_now = sheet.row_values(1)
@@ -201,14 +188,12 @@ def ensure_subscribed_since(user_id: int) -> datetime:
     return datetime.fromisoformat(now)
 
 def can_issue(user_id: int) -> bool:
-    """Проверка условия по времени подписки (если включено)."""
     if SUBSCRIPTION_MIN_DAYS <= 0:
         return True
     since = ensure_subscribed_since(user_id)
     return (datetime.now() - since).days >= SUBSCRIPTION_MIN_DAYS
 
 def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[str, bool]:
-    """Выдать промокод (или вернуть существующий). Возврат: (code, is_new)."""
     _, existing = find_user_code(user_id)
     if existing:
         return existing, False
@@ -228,7 +213,6 @@ def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[
     return code, True
 
 def redeem_code(code: str, staff_username: str) -> Tuple[bool, str]:
-    """Погасить код сотрудником. True/False + сообщение пользователю."""
     for i, rec in enumerate(sheet.get_all_records(), start=2):
         if rec.get("PromoCode") == code:
             if rec.get("DateRedeemed"):
@@ -259,7 +243,6 @@ def redeem_code(code: str, staff_username: str) -> Tuple[bool, str]:
     return False, "Промокод не найден ❌"
 
 def is_subscribed(user_id: int) -> bool:
-    """Проверка членства в канале."""
     try:
         m = bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
         return m.status in ("member", "administrator", "creator")
@@ -267,7 +250,6 @@ def is_subscribed(user_id: int) -> bool:
         return False
 
 def do_check_subscription(chat_id: int, user):
-    """Inline-процедура: проверка подписки и выдача промокода при необходимости."""
     if not is_subscribed(user.id):
         bot.send_message(
             chat_id,
@@ -289,23 +271,12 @@ def do_check_subscription(chat_id: int, user):
 # ---------- Handlers ----------
 @bot.message_handler(commands=["start", "help"])
 def start(message):
-    # deep-link source (если /start xxx)
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1 and parts[1].strip():
         USER_SOURCE[message.from_user.id] = parts[1].strip()[:32].lower()
 
-    # Приветствие + клиентская клавиатура
-    bot.send_message(
-        message.chat.id,
-        WELCOME,
-        reply_markup=make_main_keyboard(message.from_user.id)
-    )
-    # Сообщение с inline-кнопками для подписки/получения кода
-    bot.send_message(
-        message.chat.id,
-        "Хочешь промокод? Нажми кнопку ниже 👇",
-        reply_markup=inline_subscribe_keyboard()
-    )
+    bot.send_message(message.chat.id, WELCOME, reply_markup=make_main_keyboard(message.from_user.id))
+    bot.send_message(message.chat.id, "Хочешь промокод? Нажми кнопку ниже 👇", reply_markup=inline_subscribe_keyboard())
 
 @bot.callback_query_handler(func=lambda c: c.data == "check_and_issue")
 def cb_check_and_issue(cb):
@@ -319,17 +290,52 @@ def cb_check_and_issue(cb):
 def handle_about(message):
     bot.reply_to(message, BRAND_ABOUT, parse_mode="HTML")
 
+# ---------- Персонал / Админ (ВЫШЕ общего обработчика!) ----------
+@bot.message_handler(func=lambda m: m.text == BTN_STAFF_VERIFY)
+def handle_staff_verify(message):
+    if not is_staff(message.from_user.id):
+        bot.reply_to(message, "Доступно только сотрудникам.")
+        return
+    STATE[message.from_user.id] = "await_code"
+    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
+    bot.reply_to(message, "Введите промокод для проверки/погашения (4 символа) или нажмите «Отмена».", reply_markup=kb)
+
+@bot.message_handler(func=lambda m: m.text == BTN_ADMIN_ADD_STAFF)
+def handle_admin_add_staff(message):
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Доступно только администратору.")
+        return
+    STATE[message.from_user.id] = "await_staff_id"
+    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
+    bot.reply_to(
+        message,
+        "Пришлите ID пользователя-сотрудника (цифрами), или перешлите его сообщение, "
+        "или отправьте его контакт из Telegram. Либо «Отмена».",
+        reply_markup=kb
+    )
+
+@bot.message_handler(content_types=["contact"])
+def handle_contact(message):
+    uid = message.from_user.id
+    if STATE.get(uid) != "await_staff_id":
+        return
+    contact = message.contact
+    if contact and getattr(contact, "user_id", None):
+        add_staff_id(int(contact.user_id))
+        STATE.pop(uid, None)
+        bot.reply_to(message, f"Сотрудник добавлен: {contact.user_id} ✅", reply_markup=make_main_keyboard(uid))
+    else:
+        bot.reply_to(message, "Этот контакт не содержит user_id Telegram. Пришлите ID цифрами или перешлите сообщение.")
+
 # ---------- Отзывы ----------
 @bot.message_handler(func=lambda m: m.text == BTN_FEEDBACK)
 def handle_feedback_start(message):
     uid = message.from_user.id
     FEEDBACK_DRAFT[uid] = {"rating": None, "text": None, "photos": []}
     STATE[uid] = "await_feedback_rating"
-    bot.reply_to(
-        message,
-        "Оцените нас по пятибалльной шкале (1 – плохо, 5 – отлично).",
-        reply_markup=rating_keyboard()
-    )
+    bot.reply_to(message, "Оцените нас по пятибалльной шкале (1 – плохо, 5 – отлично).", reply_markup=rating_keyboard())
 
 @bot.message_handler(func=lambda m: m.text in RATING_BTNS)
 def handle_feedback_rating(message):
@@ -341,11 +347,7 @@ def handle_feedback_rating(message):
     STATE[uid] = "await_feedback_text"
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
-    bot.reply_to(
-        message,
-        "Спасибо! Теперь напишите ваш отзыв одним сообщением.",
-        reply_markup=kb
-    )
+    bot.reply_to(message, "Спасибо! Теперь напишите ваш отзыв одним сообщением.", reply_markup=kb)
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
@@ -385,30 +387,27 @@ def handle_cancel(message):
     FEEDBACK_DRAFT.pop(uid, None)
     bot.reply_to(message, "Отменено.", reply_markup=make_main_keyboard(uid))
 
+# ---------- Общий обработчик ТЕКСТА (последним!) ----------
 @bot.message_handler(content_types=["text"])
 def handle_text_general(message):
     uid = message.from_user.id
     state = STATE.get(uid)
 
-    # Шаг текста отзыва
     if state == "await_feedback_text":
         text = (message.text or "").strip()
         FEEDBACK_DRAFT[uid]["text"] = text
         STATE[uid] = "await_feedback_photos"
         bot.reply_to(
             message,
-            "Отлично! Теперь можете прислать до 5 фото. "
-            "Когда будете готовы — нажмите «✅ Отправить» или «⏩ Пропустить фото».",
+            "Отлично! Теперь можете прислать до 5 фото. Когда будете готовы — нажмите «✅ Отправить» или «⏩ Пропустить фото».",
             reply_markup=photos_keyboard()
         )
         return
 
-    # Ожидание фото: пришёл произвольный текст
     if state == "await_feedback_photos":
         bot.reply_to(message, "Пришлите фото или нажмите «✅ Отправить» / «⏩ Пропустить фото».", reply_markup=photos_keyboard())
         return
 
-    # Добавление сотрудника (админ)
     if state == "await_staff_id":
         new_id = None
         if hasattr(message, "forward_from") and message.forward_from:
@@ -425,7 +424,6 @@ def handle_text_general(message):
         bot.reply_to(message, f"Сотрудник добавлен: {new_id} ✅", reply_markup=make_main_keyboard(uid))
         return
 
-    # Проверка/погашение кода
     if state == "await_code":
         code = (message.text or "").strip().upper()
         if len(code) != 4 or not all(ch in (string.ascii_uppercase + string.digits) for ch in code):
@@ -436,56 +434,14 @@ def handle_text_general(message):
         bot.reply_to(message, info, parse_mode="HTML", reply_markup=make_main_keyboard(uid))
         return
 
-    # Нейтральная подсказка
     if message.text and message.text.startswith("/"):
         bot.reply_to(message, "Используйте кнопки снизу 👇", reply_markup=make_main_keyboard(uid))
     else:
         bot.reply_to(message, "Выберите действие на клавиатуре ниже 👇", reply_markup=make_main_keyboard(uid))
 
-# ---------- Персонал / Админ ----------
-@bot.message_handler(func=lambda m: m.text == BTN_STAFF_VERIFY)
-def handle_staff_verify(message):
-    if not is_staff(message.from_user.id):
-        bot.reply_to(message, "Доступно только сотрудникам.")
-        return
-    STATE[message.from_user.id] = "await_code"
-    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
-    bot.reply_to(message, "Введите промокод для проверки/погашения (4 символа) или нажмите «Отмена».", reply_markup=kb)
-
-@bot.message_handler(func=lambda m: m.text == BTN_ADMIN_ADD_STAFF)
-def handle_admin_add_staff(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Доступно только администратору.")
-        return
-    STATE[message.from_user.id] = "await_staff_id"
-    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
-    bot.reply_to(
-        message,
-        "Пришлите ID пользователя-сотрудника (цифрами), "
-        "или перешлите его сообщение, "
-        "или отправьте его контакт из Telegram. Либо «Отмена».",
-        reply_markup=kb
-    )
-
-@bot.message_handler(content_types=["contact"])
-def handle_contact(message):
-    uid = message.from_user.id
-    if STATE.get(uid) != "await_staff_id":
-        return
-    contact = message.contact
-    if contact and getattr(contact, "user_id", None):
-        add_staff_id(int(contact.user_id))
-        STATE.pop(uid, None)
-        bot.reply_to(message, f"Сотрудник добавлен: {contact.user_id} ✅", reply_markup=make_main_keyboard(uid))
-    else:
-        bot.reply_to(message, "Этот контакт не содержит user_id Telegram. Пришлите ID цифрами или перешлите сообщение.")
-
 # ---------- FLASK (WEBHOOK/POLLING) ----------
 app = Flask(__name__)
 
-# Сформируем BASE_URL (приоритет: BASE_URL -> RENDER_EXTERNAL_HOSTNAME)
 _ext = os.getenv("BASE_URL", "").strip()
 if not _ext:
     host = os.getenv("RENDER_EXTERNAL_HOSTNAME", "").strip()
@@ -530,7 +486,6 @@ def run_with_polling():
     bot.infinity_polling(none_stop=True, timeout=60, long_polling_timeout=60)
 
 if __name__ == "__main__":
-    # Если WEBHOOK_URL валиден — работаем через webhook; иначе — polling
     if WEBHOOK_URL:
         run_with_webhook()
     else:
