@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-SBALO Promo Bot — Webhook версия для Render (кнопки + короткие промокоды)
-Новая версия:
-- Нижняя клавиатура: «ℹ️ О бренде», «📝 Оставить отзыв»
-- Отзывы с рейтингом 1–5 и опциональными фото (1–5 штук)
-- Отзывы сохраняются в отдельный лист Google Sheets: Feedback
-- Сохранил кнопки персонала/админа (проверка кода, добавление сотрудника)
+SBALO Promo Bot — Webhook версия для Render
+Изменения:
+- Новое приветствие
+- Новое описание бренда
+- Отзывы с рейтингом и фото (сохраняются в Google Sheets)
 """
 
 import os, random, string
@@ -69,11 +68,10 @@ except gspread.WorksheetNotFound:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # Состояния
-STATE: Dict[int, str] = {}  # user_id -> state flag
-USER_SOURCE: Dict[int, str] = {}  # user_id -> source
+STATE: Dict[int, str] = {}  
+USER_SOURCE: Dict[int, str] = {}  
 
-# Черновики отзывов
-FEEDBACK_DRAFT: Dict[int, Dict] = {}  # {uid: {"rating": int, "text": str, "photos": [file_id,...]}}
+FEEDBACK_DRAFT: Dict[int, Dict] = {}  
 
 # Текст кнопок
 BTN_ABOUT = "ℹ️ О бренде"
@@ -113,6 +111,21 @@ def inline_subscribe_keyboard():
     ikb.add(telebot.types.InlineKeyboardButton("🔄 Проверить подписку", callback_data="check_sub"))
     return ikb
 
+# ---------- Тексты ----------
+WELCOME = (
+    "Добро пожаловать в <b>SBALO</b> 👠✨\n"
+    "Здесь ты найдёшь вдохновение, узнаешь о новинках бренда и сможешь поделиться своим впечатлением.\n\n"
+    "Выбирай кнопки снизу и будь ближе к миру SBALO."
+)
+
+BRAND_ABOUT = (
+    "<b>SBALO</b> в переводе с итальянского означает «высшая мера удовольствия» — именно это мы хотим дарить каждому.\n\n"
+    "Мы создаём обувь на фабриках в Стамбуле и Гуанчжоу, где производят коллекции мировые fashion-бренды.\n\n"
+    "В наших коллекциях используются разные материалы, но особая часть моделей создаётся из итальянской кожи высшего качества. "
+    "Она обладает уникальным свойством: через 1–2 дня носки обувь подстраивается под стопу и становится такой же удобной, как любимые тапочки.\n\n"
+    "SBALO — это твой стиль и твой комфорт в каждом шаге."
+)
+
 # ---------- Утилиты ----------
 def generate_short_code() -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -132,96 +145,6 @@ def append_row_dict(ws, header_list, data: dict):
             row[headers_now.index(k)] = str(v)
     ws.append_row(row)
 
-def get_row_by_user(user_id):
-    for i, rec in enumerate(sheet.get_all_records(), start=2):
-        if str(rec.get("UserID")) == str(user_id):
-            return i, rec
-    return None, None
-
-def find_user_code(user_id):
-    i, rec = get_row_by_user(user_id)
-    if i and rec.get("PromoCode"):
-        return i, rec["PromoCode"]
-    return None, None
-
-def ensure_subscribed_since(user_id):
-    i, rec = get_row_by_user(user_id)
-    now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    headers_now = sheet.row_values(1)
-    if "SubscribedSince" not in headers_now:
-        sheet.update_cell(1, len(headers_now) + 1, "SubscribedSince")
-        headers_now = sheet.row_values(1)
-    if i and rec.get("SubscribedSince"):
-        try:
-            return datetime.fromisoformat(rec["SubscribedSince"])
-        except Exception:
-            pass
-    if i:
-        col = sheet.row_values(1).index("SubscribedSince") + 1
-        sheet.update_cell(i, col, now)
-    else:
-        append_row_dict(sheet, HEADERS, {
-            "UserID": str(user_id),
-            "Source": "subscribe_check",
-            "SubscribedSince": now
-        })
-    return datetime.fromisoformat(now)
-
-def can_issue(user_id):
-    if SUBSCRIPTION_MIN_DAYS <= 0:
-        return True
-    since = ensure_subscribed_since(user_id)
-    return (datetime.now() - since).days >= SUBSCRIPTION_MIN_DAYS
-
-def issue_code(user_id, username, source="subscribe"):
-    _, existing = find_user_code(user_id)
-    if existing:
-        return existing, False
-    code = generate_short_code()
-    now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    append_row_dict(sheet, HEADERS, {
-        "UserID": str(user_id),
-        "Username": username or "",
-        "PromoCode": code,
-        "DateIssued": now,
-        "DateRedeemed": "",
-        "RedeemedBy": "",
-        "Source": source,
-        "SubscribedSince": "",
-        "Discount": DISCOUNT_LABEL,
-    })
-    return code, True
-
-def redeem_code(code, staff_username):
-    for i, rec in enumerate(sheet.get_all_records(), start=2):
-        if rec.get("PromoCode") == code:
-            if rec.get("DateRedeemed"):
-                return False, (
-                    "❌ Код уже погашен ранее.\n"
-                    f"Скидка: {rec.get('Discount', '')}\n"
-                    f"Дата выдачи: {rec.get('DateIssued', '')}\n"
-                    f"Дата погашения: {rec.get('DateRedeemed', '')}\n"
-                    f"Погасил: {rec.get('RedeemedBy', '')}\n"
-                )
-            now = datetime.now().isoformat(sep=" ", timespec="seconds")
-            headers_now = sheet.row_values(1)
-            idx = {h: headers_now.index(h) for h in headers_now if h in headers_now}
-            sheet.update_cell(i, idx["DateRedeemed"] + 1, now)
-            sheet.update_cell(i, idx["RedeemedBy"] + 1, staff_username or "Staff")
-            discount = rec.get("Discount", DISCOUNT_LABEL)
-            issued = rec.get("DateIssued", "")
-            source = rec.get("Source", "")
-            reply = (
-                "✅ Код действителен и помечен как использованный.\n\n"
-                f"Код: <b>{code}</b>\n"
-                f"Скидка: <b>{discount}</b>\n"
-                f"Выдан: {issued}\n"
-                f"Источник: {source}\n"
-                f"Сотрудник: @{staff_username if staff_username else 'Staff'}"
-            )
-            return True, reply
-    return False, "Промокод не найден ❌"
-
 def is_subscribed(user_id):
     try:
         m = bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
@@ -229,51 +152,12 @@ def is_subscribed(user_id):
     except Exception:
         return False
 
-WELCOME = (
-    "Привет! 👋 Это промо-бот <b>SBALO</b>.\n\n"
-    "Подпишись на наш канал: {channel}\n"
-    "Если захочешь — проверь подписку через кнопку ниже.\n\n"
-    "Также снизу есть кнопки: «О бренде» и «Оставить отзыв»."
-)
-
-BRAND_ABOUT = (
-    "<b>SBALO</b> — бренд, который дарит высшую меру удовольствия от обуви и образа.\n"
-    "Мы делаем модную и комфортную обувь и аксессуары для реальной жизни.\n\n"
-    "• Качество и посадка — приоритет\n"
-    "• Стили — от casual до вечерних\n"
-    "• Поддержка и уход — прямо из бота\n\n"
-    f"Новости и релизы: {CHANNEL_USERNAME}"
-)
-
-def do_check_subscription(chat_id, user):
-    if not is_subscribed(user.id):
-        bot.send_message(
-            chat_id,
-            f"Подпишись на {CHANNEL_USERNAME}, затем нажми «Проверить подписку».",
-            reply_markup=inline_subscribe_keyboard()
-        )
-        return
-    if not can_issue(user.id):
-        bot.send_message(chat_id, "Спасибо за подписку! Промокод станет доступен позже.")
-        return
-    src = USER_SOURCE.get(user.id, "subscribe")
-    code, _ = issue_code(user.id, user.username, source=src)
-    bot.send_message(
-        chat_id,
-        f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
-        parse_mode="HTML"
-    )
-
 # ---------- Handlers ----------
 @bot.message_handler(commands=["start", "help"])
 def start(message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) > 1 and parts[1].strip():
-        USER_SOURCE[message.from_user.id] = parts[1].strip()[:32].lower()
-
     bot.send_message(
         message.chat.id,
-        WELCOME.format(channel=CHANNEL_USERNAME),
+        WELCOME,
         reply_markup=make_main_keyboard(message.from_user.id)
     )
     bot.send_message(
@@ -282,24 +166,15 @@ def start(message):
         reply_markup=inline_subscribe_keyboard()
     )
 
-@bot.callback_query_handler(func=lambda c: c.data == "check_sub")
-def check_sub(cb):
-    do_check_subscription(cb.message.chat.id, cb.from_user)
-    try:
-        bot.answer_callback_query(cb.id)
-    except Exception:
-        pass
-
-# --- О бренде ---
 @bot.message_handler(func=lambda m: m.text == BTN_ABOUT)
 def handle_about(message):
     bot.reply_to(message, BRAND_ABOUT, parse_mode="HTML")
 
-# --- Оставить отзыв: рейтинг -> текст -> фото -> отправка ---
+# ---------- Отзывы (рейтинг + текст + фото) ----------
 @bot.message_handler(func=lambda m: m.text == BTN_FEEDBACK)
 def handle_feedback_start(message):
     uid = message.from_user.id
-    FEEDBACK_DRAFT[uid] = {"rating": None, "text": None, "photos": []}  # новый черновик
+    FEEDBACK_DRAFT[uid] = {"rating": None, "text": None, "photos": []}
     STATE[uid] = "await_feedback_rating"
     bot.reply_to(
         message,
@@ -312,12 +187,7 @@ def handle_feedback_rating(message):
     uid = message.from_user.id
     if STATE.get(uid) != "await_feedback_rating":
         return
-    try:
-        rating = int((message.text or "").split()[-1])
-    except Exception:
-        bot.reply_to(message, "Выберите рейтинг на клавиатуре (1–5).", reply_markup=rating_keyboard())
-        return
-    FEEDBACK_DRAFT.setdefault(uid, {"rating": None, "text": None, "photos": []})
+    rating = int((message.text or "").split()[-1])
     FEEDBACK_DRAFT[uid]["rating"] = rating
     STATE[uid] = "await_feedback_text"
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -328,52 +198,31 @@ def handle_feedback_rating(message):
         reply_markup=kb
     )
 
-@bot.message_handler(func=lambda m: m.text == BTN_CANCEL)
-def handle_cancel(message):
-    uid = message.from_user.id
-    STATE.pop(uid, None)
-    FEEDBACK_DRAFT.pop(uid, None)
-    bot.reply_to(message, "Отменено.", reply_markup=make_main_keyboard(uid))
-
 @bot.message_handler(content_types=["text"])
 def handle_text_general(message):
     uid = message.from_user.id
     state = STATE.get(uid)
 
-    # Текст отзыва
     if state == "await_feedback_text":
         text = (message.text or "").strip()
-        if not text:
-            bot.reply_to(message, "Пустой отзыв не сохранён. Напишите текст или нажмите «Отмена».")
-            return
-        FEEDBACK_DRAFT.setdefault(uid, {"rating": None, "text": None, "photos": []})
         FEEDBACK_DRAFT[uid]["text"] = text
         STATE[uid] = "await_feedback_photos"
         bot.reply_to(
             message,
-            "Отлично! Теперь можете прислать 1–5 фото (по одному или альбомом). "
-            "Когда будете готовы — нажмите «✅ Отправить», либо «⏩ Пропустить фото».",
+            "Отлично! Теперь можете прислать до 5 фото. "
+            "Когда будете готовы — нажмите «✅ Отправить» или «⏩ Пропустить фото».",
             reply_markup=photos_keyboard()
         )
         return
 
-    # Завершение отправки отзыва без фото/с фото
     if state == "await_feedback_photos" and message.text in (BTN_SEND_FEEDBACK, BTN_SKIP_PHOTOS):
         draft = FEEDBACK_DRAFT.get(uid, {})
-        rating = draft.get("rating")
-        text = draft.get("text")
-        photos: List[str] = draft.get("photos", [])
-        if rating is None or not text:
-            bot.reply_to(message, "Не хватает данных отзыва. Начните заново: «📝 Оставить отзыв».")
-            STATE.pop(uid, None)
-            FEEDBACK_DRAFT.pop(uid, None)
-            return
         feedback_ws.append_row([
             str(uid),
             message.from_user.username or "",
-            str(rating),
-            text,
-            ",".join(photos) if photos else "",
+            str(draft.get("rating")),
+            draft.get("text"),
+            ",".join(draft.get("photos", [])),
             datetime.now().isoformat(sep=" ", timespec="seconds")
         ])
         STATE.pop(uid, None)
@@ -381,87 +230,17 @@ def handle_text_general(message):
         bot.reply_to(message, "Спасибо за отзыв! Он сохранён ✅", reply_markup=make_main_keyboard(uid))
         return
 
-    # Добавление сотрудника (админ)
-    if state == "await_staff_id":
-        new_id = None
-        if hasattr(message, "forward_from") and message.forward_from:
-            new_id = message.forward_from.id
-        else:
-            txt = (message.text or "").strip()
-            if txt.isdigit():
-                new_id = int(txt)
-
-        if not new_id:
-            bot.reply_to(message, "Не удалось определить ID. Пришлите число или перешлите сообщение от пользователя.")
-            return
-
-        STAFF_IDS.add(new_id)
-        os.environ["STAFF_IDS"] = ",".join(str(x) for x in sorted(STAFF_IDS))
-        STATE.pop(uid, None)
-        bot.reply_to(message, f"Сотрудник добавлен: {new_id} ✅", reply_markup=make_main_keyboard(uid))
-        return
-
-    # Проверка/погашение кода (сотрудники)
-    if state == "await_code":
-        code = (message.text or "").strip().upper()
-        if len(code) != 4 or not all(ch in (string.ascii_uppercase + string.digits) for ch in code):
-            bot.reply_to(message, "Неверный формат. Введите 4 символа A–Z/0–9.")
-            return
-        ok, info = redeem_code(code, message.from_user.username or "Staff")
-        STATE.pop(uid, None)
-        bot.reply_to(message, info, parse_mode="HTML", reply_markup=make_main_keyboard(uid))
-        return
-
-    # Нет активного состояния — обычная подсказка
-    if message.text and message.text.startswith("/"):
-        bot.reply_to(message, "Используйте кнопки снизу 👇", reply_markup=make_main_keyboard(uid))
-    else:
-        bot.reply_to(message, "Выберите действие на клавиатуре ниже 👇", reply_markup=make_main_keyboard(uid))
-
-# Приём фото для отзыва
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     uid = message.from_user.id
     if STATE.get(uid) != "await_feedback_photos":
         return
-    # берём максимальное качество
-    if not message.photo:
-        return
     file_id = message.photo[-1].file_id
-    FEEDBACK_DRAFT.setdefault(uid, {"rating": None, "text": None, "photos": []})
-    photos: List[str] = FEEDBACK_DRAFT[uid]["photos"]
-    if len(photos) >= 5:
-        bot.reply_to(message, "Можно приложить не более 5 фото. Нажмите «✅ Отправить» или «⏩ Пропустить фото».",
-                     reply_markup=photos_keyboard())
-        return
-    photos.append(file_id)
-    bot.reply_to(message, f"Фото добавлено ({len(photos)}/5). Можете прислать ещё или нажать «✅ Отправить».",
-                 reply_markup=photos_keyboard())
-
-# Кнопки персонала/админа
-@bot.message_handler(func=lambda m: m.text == BTN_STAFF_VERIFY)
-def handle_staff_verify(message):
-    if STAFF_IDS and message.from_user.id not in STAFF_IDS:
-        bot.reply_to(message, "Доступно только сотрудникам.")
-        return
-    STATE[message.from_user.id] = "await_code"
-    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
-    bot.reply_to(message, "Введите промокод для проверки/погашения (4 символа) или нажмите «Отмена».", reply_markup=kb)
-
-@bot.message_handler(func=lambda m: m.text == BTN_ADMIN_ADD_STAFF)
-def handle_admin_add_staff(message):
-    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
-        bot.reply_to(message, "Доступно только администратору.")
-        return
-    STATE[message.from_user.id] = "await_staff_id"
-    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
-    bot.reply_to(
-        message,
-        "Пришлите ID пользователя-сотрудника (цифрами) или перешлите его любое сообщение. Либо «Отмена».",
-        reply_markup=kb
-    )
+    if len(FEEDBACK_DRAFT[uid]["photos"]) < 5:
+        FEEDBACK_DRAFT[uid]["photos"].append(file_id)
+        bot.reply_to(message, f"Фото добавлено ({len(FEEDBACK_DRAFT[uid]['photos'])}/5).", reply_markup=photos_keyboard())
+    else:
+        bot.reply_to(message, "Можно прикрепить не более 5 фото.", reply_markup=photos_keyboard())
 
 # ---------- FLASK (WEBHOOK) ----------
 app = Flask(__name__)
@@ -492,5 +271,4 @@ if __name__ == "__main__":
         print("Failed to set webhook:", e)
 
     port = int(os.getenv("PORT", "10000"))
-    print("SBALO Promo Bot (Webhook) started on port", port)
     app.run(host="0.0.0.0", port=port)
