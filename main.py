@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 """
 SBALO Promo Bot — Webhook версия для Render (кнопки + короткие промокоды)
@@ -125,11 +124,13 @@ def ensure_subscribed_since(user_id):
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     headers = sheet.row_values(1)
     if "SubscribedSince" not in headers:
-        sheet.append_row(["SubscribedSince"])  # страховка, но выше уже гарантировали HEADERS
+        # страховка, но выше уже гарантировали HEADERS
+        sheet.update_cell(1, len(headers) + 1, "SubscribedSince")
+        headers = sheet.row_values(1)
     if i and rec.get("SubscribedSince"):
         try:
             return datetime.fromisoformat(rec["SubscribedSince"])
-        except:
+        except Exception:
             pass
     if i:
         col = sheet.row_values(1).index("SubscribedSince") + 1
@@ -181,6 +182,7 @@ def redeem_code(code, staff_username):
                     f"Погасил: {rec.get('RedeemedBy', '')}\n"
                 )
             now = datetime.now().isoformat(sep=" ", timespec="seconds")
+            # Вычислим индексы колонок
             headers = sheet.row_values(1)
             idx = {h: headers.index(h) for h in headers if h in headers}
             sheet.update_cell(i, idx["DateRedeemed"] + 1, now)
@@ -206,12 +208,11 @@ def is_subscribed(user_id):
     except Exception:
         return False
 
-WELCOME = ("Привет! 👋 Это промо-бот <b>SBALO</b>.
-
-"
-           "Подпишись на наш канал: {channel}
-"
-           "После подписки нажми «Проверить подписку» или «Получить промокод».")
+WELCOME = (
+    "Привет! 👋 Это промо-бот <b>SBALO</b>.\n\n"
+    "Подпишись на наш канал: {channel}\n"
+    "После подписки нажми «Проверить подписку» или «Получить промокод»."
+)
 
 # ---------- Handlers ----------
 @bot.message_handler(commands=["start", "help"])
@@ -237,9 +238,11 @@ def check_sub(cb):
     u = cb.from_user
     if not is_subscribed(u.id):
         bot.answer_callback_query(cb.id, "Вы ещё не подписаны.")
-        bot.send_message(cb.message.chat.id,
-                         f"Подпишись на {CHANNEL_USERNAME}, затем нажми «Проверить подписку».",
-                         reply_markup=inline_subscribe_keyboard())
+        bot.send_message(
+            cb.message.chat.id,
+            f"Подпишись на {CHANNEL_USERNAME}, затем нажми «Проверить подписку».",
+            reply_markup=inline_subscribe_keyboard()
+        )
         return
 
     if not can_issue(u.id):
@@ -250,9 +253,11 @@ def check_sub(cb):
     src = USER_SOURCE.get(u.id, "subscribe")
     code, _ = issue_code(u.id, u.username, source=src)
     bot.answer_callback_query(cb.id, "Промокод выдан!")
-    bot.send_message(cb.message.chat.id,
-                     f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
-                     parse_mode="HTML")
+    bot.send_message(
+        cb.message.chat.id,
+        f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
+        parse_mode="HTML"
+    )
 
 @bot.message_handler(func=lambda m: m.text == BTN_CHECK_SUB)
 def handle_check_sub_button(message):
@@ -283,10 +288,9 @@ def handle_staff_verify(message):
         bot.reply_to(message, "Доступно только сотрудникам.")
         return
     STATE[message.from_user.id] = "await_code"
-    bot.reply_to(message, "Введите промокод для проверки/погашения (4 символа) или нажмите «Отмена».",
-                 reply_markup=telebot.types.ReplyKeyboardMarkup(resize_keyboard=True).add(
-                     telebot.types.KeyboardButton(BTN_CANCEL)
-                 ))
+    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
+    bot.reply_to(message, "Введите промокод для проверки/погашения (4 символа) или нажмите «Отмена».", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == BTN_ADMIN_ADD_STAFF)
 def handle_admin_add_staff(message):
@@ -294,10 +298,13 @@ def handle_admin_add_staff(message):
         bot.reply_to(message, "Доступно только администратору.")
         return
     STATE[message.from_user.id] = "await_staff_id"
-    bot.reply_to(message, "Пришлите ID пользователя-сотрудника (цифрами) или перешлите его любое сообщение. Либо «Отмена».",
-                 reply_markup=telebot.types.ReplyKeyboardMarkup(resize_keyboard=True).add(
-                     telebot.types.KeyboardButton(BTN_CANCEL)
-                 ))
+    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
+    bot.reply_to(
+        message,
+        "Пришлите ID пользователя-сотрудника (цифрами) или перешлите его любое сообщение. Либо «Отмена».",
+        reply_markup=kb
+    )
 
 @bot.message_handler(func=lambda m: m.text == BTN_CANCEL)
 def handle_cancel(message):
