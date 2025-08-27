@@ -173,18 +173,14 @@ def redeem_code(code, staff_username):
     for i, rec in enumerate(sheet.get_all_records(), start=2):
         if rec.get("PromoCode") == code:
             if rec.get("DateRedeemed"):
-                return False, (
-                    "❌ Код уже погашен ранее.
-"
-                    f"Скидка: {rec.get('Discount', '')}
-"
-                    f"Дата выдачи: {rec.get('DateIssued', '')}
-"
-                    f"Дата погашения: {rec.get('DateRedeemed', '')}
-"
-                    f"Погасил: {rec.get('RedeemedBy', '')}
-"
-                )
+return False, (
+    "❌ Код уже погашен ранее.\n"
+    f"Скидка: {rec.get('Discount', '')}\n"
+    f"Дата выдачи: {rec.get('DateIssued', '')}\n"
+    f"Дата погашения: {rec.get('DateRedeemed', '')}\n"
+    f"Погасил: {rec.get('RedeemedBy', '')}\n"
+)
+
             now = datetime.now().isoformat(sep=" ", timespec="seconds")
             # Вычислим индексы колонок
             headers = sheet.row_values(1)
