@@ -173,16 +173,14 @@ def redeem_code(code, staff_username):
     for i, rec in enumerate(sheet.get_all_records(), start=2):
         if rec.get("PromoCode") == code:
             if rec.get("DateRedeemed"):
-return False, (
-    "❌ Код уже погашен ранее.\n"
-    f"Скидка: {rec.get('Discount', '')}\n"
-    f"Дата выдачи: {rec.get('DateIssued', '')}\n"
-    f"Дата погашения: {rec.get('DateRedeemed', '')}\n"
-    f"Погасил: {rec.get('RedeemedBy', '')}\n"
-)
-
+                return False, (
+                    "❌ Код уже погашен ранее.\n"
+                    f"Скидка: {rec.get('Discount', '')}\n"
+                    f"Дата выдачи: {rec.get('DateIssued', '')}\n"
+                    f"Дата погашения: {rec.get('DateRedeemed', '')}\n"
+                    f"Погасил: {rec.get('RedeemedBy', '')}\n"
+                )
             now = datetime.now().isoformat(sep=" ", timespec="seconds")
-            # Вычислим индексы колонок
             headers = sheet.row_values(1)
             idx = {h: headers.index(h) for h in headers if h in headers}
             sheet.update_cell(i, idx["DateRedeemed"] + 1, now)
@@ -191,9 +189,7 @@ return False, (
             issued = rec.get("DateIssued", "")
             source = rec.get("Source", "")
             reply = (
-                "✅ Код действителен и помечен как использованный.
-
-"
+                "✅ Код действителен и помечен как использованный.\n\n"
                 f"Код: <b>{code}</b>\n"
                 f"Скидка: <b>{discount}</b>\n"
                 f"Выдан: {issued}\n"
