@@ -2,14 +2,17 @@
 """
 SBALO Promo Bot — версия для Render (webhook с fallback на polling)
 
-Добавлено:
-- Кнопка «📊 Статистика» в основном меню (для админа и сотрудников)
-- Сотрудники могут смотреть статистику (меню/команды)
-- Скидка по умолчанию уменьшена до 5%
+Функции:
+- Несколько админов через ENV ADMIN_IDS=123,456,789
+- Кнопка «📊 Статистика» в основном меню (для админа(ов) и сотрудников)
+- Статистика подписок/отписок по источникам (месяц/всё время), инлайн-меню
+- Сотрудники могут смотреть статистику
+- Скидка по умолчанию 5%
+- Сотрудники МОГУТ добавлять новых сотрудников
 """
 
 import os, random, string, calendar
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, Set, List, Tuple, Optional
 
 import telebot
@@ -22,11 +25,13 @@ from oauth2client.service_account import ServiceAccountCredentials
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")  # например: @sbalo_channel
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+# STAFF_IDS — сотрудники (могут гасить коды, смотреть статистику, добавлять сотрудников)
 STAFF_IDS: Set[int] = set(int(x) for x in os.getenv("STAFF_IDS", "").split(",") if x.strip().isdigit())
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# ADMIN_IDS — список админов (имеют полный доступ, включая /subs_refresh)
+ADMIN_IDS: List[int] = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 SUBSCRIPTION_MIN_DAYS = int(os.getenv("SUBSCRIPTION_MIN_DAYS", "0"))
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
-DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "5%")  # ← было 7%, теперь 5% по умолчанию
+DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "5%")  # 5% по умолчанию
 
 if not SERVICE_ACCOUNT_JSON:
     raise SystemExit("ENV SERVICE_ACCOUNT_JSON пуст — вставьте содержимое credentials.json в переменную окружения.")
@@ -77,8 +82,8 @@ FEEDBACK_DRAFT: Dict[int, Dict] = {}
 BTN_ABOUT = "ℹ️ О бренде"
 BTN_FEEDBACK = "📝 Оставить отзыв"
 BTN_STAFF_VERIFY = "✅ Проверить/Погасить код"
-BTN_ADMIN_ADD_STAFF = "➕ Добавить сотрудника"
-BTN_STATS_MENU = "📊 Статистика"  # ← новая кнопка
+BTN_ADMIN_ADD_STAFF = "➕ Добавить сотрудника"  # видна сотрудникам и админам
+BTN_STATS_MENU = "📊 Статистика"
 BTN_CANCEL = "❌ Отмена"
 BTN_SKIP_PHOTOS = "⏩ Пропустить фото"
 BTN_SEND_FEEDBACK = "✅ Отправить"
@@ -86,13 +91,14 @@ RATING_BTNS = ["⭐ 1","⭐ 2","⭐ 3","⭐ 4","⭐ 5"]
 
 # ---------- Права ----------
 def is_admin(uid: int) -> bool:
-    return bool(ADMIN_ID) and uid == ADMIN_ID
+    return uid in ADMIN_IDS
 
 def is_staff(uid: int) -> bool:
     return uid in STAFF_IDS or is_admin(uid)
 
 def add_staff_id(new_id: int) -> None:
     STAFF_IDS.add(new_id)
+    # Обновим ENV в рантайме (для текущего процесса), в Render ENV менять вручную
     os.environ["STAFF_IDS"] = ",".join(str(x) for x in sorted(STAFF_IDS))
 
 # ---------- Клавиатуры ----------
@@ -101,8 +107,7 @@ def make_main_keyboard(user_id: int):
     kb.add(telebot.types.KeyboardButton(BTN_ABOUT), telebot.types.KeyboardButton(BTN_FEEDBACK))
     if is_staff(user_id):
         kb.add(telebot.types.KeyboardButton(BTN_STAFF_VERIFY))
-        kb.add(telebot.types.KeyboardButton(BTN_STATS_MENU))  # ← показываем статистику сотрудникам и админу
-    if is_admin(user_id):
+        kb.add(telebot.types.KeyboardButton(BTN_STATS_MENU))
         kb.add(telebot.types.KeyboardButton(BTN_ADMIN_ADD_STAFF))
     return kb
 
@@ -218,7 +223,7 @@ def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[
         "RedeemedBy": "",
         "Source": source,
         "SubscribedSince": "",
-        "Discount": DISCOUNT_LABEL,  # ← теперь 5% по умолчанию
+        "Discount": DISCOUNT_LABEL,  # 5% по умолчанию
     })
     return code, True
 
@@ -278,7 +283,7 @@ def do_check_subscription(chat_id: int, user):
         parse_mode="HTML"
     )
 
-# ---------- Вспомогательные функции для статистики ----------
+# ---------- Статистика ----------
 def parse_iso(dt_str: str) -> Optional[datetime]:
     if not dt_str:
         return None
@@ -294,14 +299,14 @@ def month_bounds(year: int, month: int) -> Tuple[datetime, datetime]:
     return start, end
 
 def get_subscribe_date(rec: dict) -> Optional[datetime]:
-    # Берём SubscribedSince; если пусто — DateIssued как прокси
+    # Основной источник — SubscribedSince; если пусто — DateIssued как прокси
     return parse_iso(rec.get("SubscribedSince") or rec.get("DateIssued") or "")
 
 def ensure_unsubscribed_col():
     ensure_column("UnsubscribedAt")
 
 def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
-    """Проставляет UnsubscribedAt тем, кто вышел из канала. Админ запускает /subs_refresh."""
+    """Проставляет UnsubscribedAt тем, кто вышел из канала. Вызывать /subs_refresh (только админ)."""
     ensure_unsubscribed_col()
     hdrs = sheet.row_values(1)
     idx = {h: hdrs.index(h) for h in hdrs}
@@ -315,12 +320,10 @@ def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
         if not uid:
             continue
         uid = int(str(uid))
-        # уже помечен/не подписан — пропускаем
         if rec.get("UnsubscribedAt"):
             continue
         if not get_subscribe_date(rec):
             continue
-
         checked += 1
         try:
             m = bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=uid)
@@ -365,7 +368,25 @@ def format_stats_by_source(title: str, subs: Dict[str, int], unsubs: Dict[str, i
     lines.append(f"Итого: подписки {total_sub}, отписки {total_unsub}, прирост {total_sub - total_unsub:+d}")
     return "\n".join(lines)
 
-# ---------- Старт / промокод / о бренде ----------
+# ---------- Инлайн-меню статистики ----------
+CB_SUBS_MENU_CUR = "subs_menu_cur"
+CB_SUBS_MENU_PREV = "subs_menu_prev"
+CB_SUBS_MENU_ALL = "subs_menu_all"
+CB_SUBS_MENU_PICK = "subs_menu_pick"
+
+def send_subs_menu(chat_id: int):
+    kb = telebot.types.InlineKeyboardMarkup()
+    kb.add(
+        telebot.types.InlineKeyboardButton("🗓 Текущий месяц", callback_data=CB_SUBS_MENU_CUR),
+        telebot.types.InlineKeyboardButton("⏮ Прошлый месяц", callback_data=CB_SUBS_MENU_PREV),
+    )
+    kb.add(
+        telebot.types.InlineKeyboardButton("📆 Выбрать месяц", callback_data=CB_SUBS_MENU_PICK),
+        telebot.types.InlineKeyboardButton("∞ Всё время", callback_data=CB_SUBS_MENU_ALL),
+    )
+    bot.send_message(chat_id, "Выберите период для статистики:", reply_markup=kb)
+
+# ---------- Хендлеры: старт/промокод/о бренде ----------
 @bot.message_handler(commands=["start", "help"])
 def start(message):
     parts = message.text.split(maxsplit=1)
@@ -387,26 +408,8 @@ def handle_about(message):
     bot.reply_to(message, BRAND_ABOUT, parse_mode="HTML")
 
 # ---------- Статистика (меню/команды) ----------
-CB_SUBS_MENU_CUR = "subs_menu_cur"
-CB_SUBS_MENU_PREV = "subs_menu_prev"
-CB_SUBS_MENU_ALL = "subs_menu_all"
-CB_SUBS_MENU_PICK = "subs_menu_pick"
-
-def send_subs_menu(chat_id: int):
-    kb = telebot.types.InlineKeyboardMarkup()
-    kb.add(
-        telebot.types.InlineKeyboardButton("🗓 Текущий месяц", callback_data=CB_SUBS_MENU_CUR),
-        telebot.types.InlineKeyboardButton("⏮ Прошлый месяц", callback_data=CB_SUBS_MENU_PREV),
-    )
-    kb.add(
-        telebot.types.InlineKeyboardButton("📆 Выбрать месяц", callback_data=CB_SUBS_MENU_PICK),
-        telebot.types.InlineKeyboardButton("∞ Всё время", callback_data=CB_SUBS_MENU_ALL),
-    )
-    bot.send_message(chat_id, "Выберите период для статистики:", reply_markup=kb)
-
 @bot.message_handler(func=lambda m: m.text == BTN_STATS_MENU)
 def handle_stats_menu_button(message):
-    # Доступ для админа и сотрудников
     if not is_staff(message.from_user.id):
         bot.reply_to(message, "Доступно только сотрудникам.")
         return
@@ -440,17 +443,16 @@ def cmd_subs_month(message):
         year, month = now.year, now.month
     start_dt, end_dt = month_bounds(year, month)
     subs, unsubs = aggregate_by_source(period=(start_dt, end_dt))
-    title = f"Подписки по источникам — {year}-{str(month).zfill(2)}"
-    text = format_stats_by_source(title, subs, unsubs)
+    text = format_stats_by_source(f"Подписки по источникам — {year}-{str(month).zfill(2)}", subs, unsubs)
     bot.reply_to(message, text)
 
 @bot.message_handler(commands=["subs_refresh"])
 def cmd_subs_refresh(message):
-    # Обновление статуса — только админ (чтобы не словить лимиты)
+    # только админы обновляют статусы (API-лимит)
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "Доступно только администратору.")
         return
-    max_checks = None  # при желании ограничить, например 500
+    max_checks = None  # можно поставить число (например, 500), чтобы ограничить проверку за вызов
     checked, updated = refresh_unsubs(max_checks=max_checks)
     bot.reply_to(message, f"Проверено: {checked}, обновлено UnsubscribedAt: {updated}")
 
@@ -500,16 +502,15 @@ def handle_staff_verify(message):
 
 @bot.message_handler(func=lambda m: m.text == BTN_ADMIN_ADD_STAFF)
 def handle_admin_add_staff(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Доступно только администратору.")
+    if not is_staff(message.from_user.id):
+        bot.reply_to(message, "Доступно только сотрудникам.")
         return
     STATE[message.from_user.id] = "await_staff_id"
     kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(telebot.types.KeyboardButton(BTN_CANCEL))
     bot.reply_to(
         message,
-        "Пришлите ID пользователя-сотрудника (цифрами), или перешлите его сообщение, "
-        "или отправьте его контакт из Telegram. Либо «Отмена».",
+        "Пришлите ID пользователя-сотрудника (цифрами), перешлите его сообщение или отправьте его контакт. Либо «Отмена».",
         reply_markup=kb
     )
 
@@ -524,7 +525,7 @@ def handle_contact(message):
         STATE.pop(uid, None)
         bot.reply_to(message, f"Сотрудник добавлен: {contact.user_id} ✅", reply_markup=make_main_keyboard(uid))
     else:
-        bot.reply_to(message, "Этот контакт не содержит user_id Telegram. Пришлите ID цифрами или перешлите сообщение.")
+        bot.reply_to(message, "Контакт не содержит user_id Telegram. Пришлите ID цифрами или перешлите сообщение.")
 
 # ---------- Отзывы ----------
 @bot.message_handler(func=lambda m: m.text == BTN_FEEDBACK)
