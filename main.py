@@ -3,12 +3,9 @@
 SBALO Promo Bot — версия для Render (webhook с fallback на polling)
 
 Добавлено:
-- Статистика подписок/отписок по источникам:
-  /subs_all — за всё время
-  /subs_month [YYYY-MM] — за месяц (текущий, если не указан)
-  /subs_refresh — обновить UnsubscribedAt по факту (админ)
-  /subs_menu — инлайн-меню для выбора периода (только админ):
-      🗓 Текущий месяц, ⏮ Прошлый месяц, 📆 Выбрать месяц, ∞ Всё время
+- Кнопка «📊 Статистика» в основном меню (для админа и сотрудников)
+- Сотрудники могут смотреть статистику (меню/команды)
+- Скидка по умолчанию уменьшена до 5%
 """
 
 import os, random, string, calendar
@@ -29,7 +26,7 @@ STAFF_IDS: Set[int] = set(int(x) for x in os.getenv("STAFF_IDS", "").split(",") 
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SUBSCRIPTION_MIN_DAYS = int(os.getenv("SUBSCRIPTION_MIN_DAYS", "0"))
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
-DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "7%")
+DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "5%")  # ← было 7%, теперь 5% по умолчанию
 
 if not SERVICE_ACCOUNT_JSON:
     raise SystemExit("ENV SERVICE_ACCOUNT_JSON пуст — вставьте содержимое credentials.json в переменную окружения.")
@@ -81,6 +78,7 @@ BTN_ABOUT = "ℹ️ О бренде"
 BTN_FEEDBACK = "📝 Оставить отзыв"
 BTN_STAFF_VERIFY = "✅ Проверить/Погасить код"
 BTN_ADMIN_ADD_STAFF = "➕ Добавить сотрудника"
+BTN_STATS_MENU = "📊 Статистика"  # ← новая кнопка
 BTN_CANCEL = "❌ Отмена"
 BTN_SKIP_PHOTOS = "⏩ Пропустить фото"
 BTN_SEND_FEEDBACK = "✅ Отправить"
@@ -103,6 +101,7 @@ def make_main_keyboard(user_id: int):
     kb.add(telebot.types.KeyboardButton(BTN_ABOUT), telebot.types.KeyboardButton(BTN_FEEDBACK))
     if is_staff(user_id):
         kb.add(telebot.types.KeyboardButton(BTN_STAFF_VERIFY))
+        kb.add(telebot.types.KeyboardButton(BTN_STATS_MENU))  # ← показываем статистику сотрудникам и админу
     if is_admin(user_id):
         kb.add(telebot.types.KeyboardButton(BTN_ADMIN_ADD_STAFF))
     return kb
@@ -171,6 +170,7 @@ def ensure_column(name: str):
 
 # ---------- Промо/подписка ----------
 def generate_short_code() -> str:
+    # 4 символа A–Z/0–9, минимум одна буква
     alphabet = string.ascii_uppercase + string.digits
     while True:
         code = "".join(random.choices(alphabet, k=4))
@@ -218,7 +218,7 @@ def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[
         "RedeemedBy": "",
         "Source": source,
         "SubscribedSince": "",
-        "Discount": DISCOUNT_LABEL,
+        "Discount": DISCOUNT_LABEL,  # ← теперь 5% по умолчанию
     })
     return code, True
 
@@ -294,12 +294,14 @@ def month_bounds(year: int, month: int) -> Tuple[datetime, datetime]:
     return start, end
 
 def get_subscribe_date(rec: dict) -> Optional[datetime]:
+    # Берём SubscribedSince; если пусто — DateIssued как прокси
     return parse_iso(rec.get("SubscribedSince") or rec.get("DateIssued") or "")
 
 def ensure_unsubscribed_col():
     ensure_column("UnsubscribedAt")
 
 def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
+    """Проставляет UnsubscribedAt тем, кто вышел из канала. Админ запускает /subs_refresh."""
     ensure_unsubscribed_col()
     hdrs = sheet.row_values(1)
     idx = {h: hdrs.index(h) for h in hdrs}
@@ -313,10 +315,12 @@ def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
         if not uid:
             continue
         uid = int(str(uid))
+        # уже помечен/не подписан — пропускаем
         if rec.get("UnsubscribedAt"):
             continue
         if not get_subscribe_date(rec):
             continue
+
         checked += 1
         try:
             m = bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=uid)
@@ -329,19 +333,20 @@ def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
     return checked, updated
 
 def aggregate_by_source(period: Optional[Tuple[datetime, datetime]] = None) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Возвращает (subs_by_source, unsubs_by_source) за период (или all-time)."""
     subs: Dict[str, int] = {}
     unsubs: Dict[str, int] = {}
     records = sheet.get_all_records()
     for rec in records:
         src = (rec.get("Source") or "default").strip() or "default"
+
         sub_dt = get_subscribe_date(rec)
-        if sub_dt:
-            if period is None or (period[0] <= sub_dt <= period[1]):
-                subs[src] = subs.get(src, 0) + 1
+        if sub_dt and (period is None or (period[0] <= sub_dt <= period[1])):
+            subs[src] = subs.get(src, 0) + 1
+
         unsub_dt = parse_iso(rec.get("UnsubscribedAt") or "")
-        if unsub_dt:
-            if period is None or (period[0] <= unsub_dt <= period[1]):
-                unsubs[src] = unsubs.get(src, 0) + 1
+        if unsub_dt and (period is None or (period[0] <= unsub_dt <= period[1])):
+            unsubs[src] = unsubs.get(src, 0) + 1
     return subs, unsubs
 
 def format_stats_by_source(title: str, subs: Dict[str, int], unsubs: Dict[str, int]) -> str:
@@ -360,7 +365,7 @@ def format_stats_by_source(title: str, subs: Dict[str, int], unsubs: Dict[str, i
     lines.append(f"Итого: подписки {total_sub}, отписки {total_unsub}, прирост {total_sub - total_unsub:+d}")
     return "\n".join(lines)
 
-# ---------- Handlers: старт/о бренде/инлайн промокод ----------
+# ---------- Старт / промокод / о бренде ----------
 @bot.message_handler(commands=["start", "help"])
 def start(message):
     parts = message.text.split(maxsplit=1)
@@ -381,49 +386,7 @@ def cb_check_and_issue(cb):
 def handle_about(message):
     bot.reply_to(message, BRAND_ABOUT, parse_mode="HTML")
 
-# ---------- Статистика (админ) ----------
-@bot.message_handler(commands=["subs_all"])
-def cmd_subs_all(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Доступно только администратору.")
-        return
-    subs, unsubs = aggregate_by_source(period=None)
-    text = format_stats_by_source("Подписки по источникам — все время", subs, unsubs)
-    bot.reply_to(message, text)
-
-@bot.message_handler(commands=["subs_month"])
-def cmd_subs_month(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Доступно только администратору.")
-        return
-    parts = message.text.split(maxsplit=1)
-    now = datetime.now()
-    if len(parts) > 1:
-        arg = parts[1].strip()
-        try:
-            y, m = arg.split("-")
-            year, month = int(y), int(m)
-        except Exception:
-            bot.reply_to(message, "Формат: /subs_month YYYY-MM (например, /subs_month 2025-08)")
-            return
-    else:
-        year, month = now.year, now.month
-    start, end = month_bounds(year, month)
-    subs, unsubs = aggregate_by_source(period=(start, end))
-    title = f"Подписки по источникам — {year}-{str(month).zfill(2)}"
-    text = format_stats_by_source(title, subs, unsubs)
-    bot.reply_to(message, text)
-
-@bot.message_handler(commands=["subs_refresh"])
-def cmd_subs_refresh(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Доступно только администратору.")
-        return
-    max_checks = None  # можно поставить число (например, 500), чтобы ограничить за раз
-    checked, updated = refresh_unsubs(max_checks=max_checks)
-    bot.reply_to(message, f"Проверено: {checked}, обновлено UnsubscribedAt: {updated}")
-
-# --- Инлайн-меню статистики ---
+# ---------- Статистика (меню/команды) ----------
 CB_SUBS_MENU_CUR = "subs_menu_cur"
 CB_SUBS_MENU_PREV = "subs_menu_prev"
 CB_SUBS_MENU_ALL = "subs_menu_all"
@@ -441,42 +404,81 @@ def send_subs_menu(chat_id: int):
     )
     bot.send_message(chat_id, "Выберите период для статистики:", reply_markup=kb)
 
-@bot.message_handler(commands=["subs_menu"])
-def cmd_subs_menu(message):
-    if not is_admin(message.from_user.id):
-        bot.reply_to(message, "Доступно только администратору.")
+@bot.message_handler(func=lambda m: m.text == BTN_STATS_MENU)
+def handle_stats_menu_button(message):
+    # Доступ для админа и сотрудников
+    if not is_staff(message.from_user.id):
+        bot.reply_to(message, "Доступно только сотрудникам.")
         return
     send_subs_menu(message.chat.id)
 
-def send_month_stats(chat_id: int, year: int, month: int):
-    start, end = month_bounds(year, month)
-    subs, unsubs = aggregate_by_source(period=(start, end))
-    title = f"Подписки по источникам — {year}-{str(month).zfill(2)}"
-    text = format_stats_by_source(title, subs, unsubs)
-    bot.send_message(chat_id, text)
-
-def send_alltime_stats(chat_id: int):
+@bot.message_handler(commands=["subs_all"])
+def cmd_subs_all(message):
+    if not is_staff(message.from_user.id):
+        bot.reply_to(message, "Доступно только сотрудникам.")
+        return
     subs, unsubs = aggregate_by_source(period=None)
     text = format_stats_by_source("Подписки по источникам — все время", subs, unsubs)
-    bot.send_message(chat_id, text)
+    bot.reply_to(message, text)
+
+@bot.message_handler(commands=["subs_month"])
+def cmd_subs_month(message):
+    if not is_staff(message.from_user.id):
+        bot.reply_to(message, "Доступно только сотрудникам.")
+        return
+    parts = message.text.split(maxsplit=1)
+    now = datetime.now()
+    if len(parts) > 1:
+        arg = parts[1].strip()
+        try:
+            y, m = arg.split("-")
+            year, month = int(y), int(m)
+        except Exception:
+            bot.reply_to(message, "Формат: /subs_month YYYY-MM (например, /subs_month 2025-08)")
+            return
+    else:
+        year, month = now.year, now.month
+    start_dt, end_dt = month_bounds(year, month)
+    subs, unsubs = aggregate_by_source(period=(start_dt, end_dt))
+    title = f"Подписки по источникам — {year}-{str(month).zfill(2)}"
+    text = format_stats_by_source(title, subs, unsubs)
+    bot.reply_to(message, text)
+
+@bot.message_handler(commands=["subs_refresh"])
+def cmd_subs_refresh(message):
+    # Обновление статуса — только админ (чтобы не словить лимиты)
+    if not is_admin(message.from_user.id):
+        bot.reply_to(message, "Доступно только администратору.")
+        return
+    max_checks = None  # при желании ограничить, например 500
+    checked, updated = refresh_unsubs(max_checks=max_checks)
+    bot.reply_to(message, f"Проверено: {checked}, обновлено UnsubscribedAt: {updated}")
 
 @bot.callback_query_handler(func=lambda c: c.data in {CB_SUBS_MENU_CUR, CB_SUBS_MENU_PREV, CB_SUBS_MENU_ALL, CB_SUBS_MENU_PICK})
 def cb_subs_menu(cb):
     uid = cb.from_user.id
-    if not is_admin(uid):
-        try: bot.answer_callback_query(cb.id, "Только для администратора.")
+    if not is_staff(uid):
+        try: bot.answer_callback_query(cb.id, "Только для сотрудников.")
         except Exception: pass
         return
 
     now = datetime.now()
     if cb.data == CB_SUBS_MENU_CUR:
-        send_month_stats(cb.message.chat.id, now.year, now.month)
+        start_dt, end_dt = month_bounds(now.year, now.month)
+        subs, unsubs = aggregate_by_source(period=(start_dt, end_dt))
+        text = format_stats_by_source(f"Подписки по источникам — {now.year}-{str(now.month).zfill(2)}", subs, unsubs)
+        bot.send_message(cb.message.chat.id, text)
     elif cb.data == CB_SUBS_MENU_PREV:
         prev_month = now.month - 1 or 12
         prev_year = now.year if now.month > 1 else now.year - 1
-        send_month_stats(cb.message.chat.id, prev_year, prev_month)
+        start_dt, end_dt = month_bounds(prev_year, prev_month)
+        subs, unsubs = aggregate_by_source(period=(start_dt, end_dt))
+        text = format_stats_by_source(f"Подписки по источникам — {prev_year}-{str(prev_month).zfill(2)}", subs, unsubs)
+        bot.send_message(cb.message.chat.id, text)
     elif cb.data == CB_SUBS_MENU_ALL:
-        send_alltime_stats(cb.message.chat.id)
+        subs, unsubs = aggregate_by_source(period=None)
+        text = format_stats_by_source("Подписки по источникам — все время", subs, unsubs)
+        bot.send_message(cb.message.chat.id, text)
     elif cb.data == CB_SUBS_MENU_PICK:
         STATE[uid] = "await_month_pick"
         bot.send_message(cb.message.chat.id, "Введите месяц в формате <b>YYYY-MM</b>, например <code>2025-08</code>.", parse_mode="HTML")
@@ -485,7 +487,7 @@ def cb_subs_menu(cb):
     except Exception:
         pass
 
-# ---------- Персонал / Админ (ВЫШЕ общего обработчика!) ----------
+# ---------- Персонал / Админ ----------
 @bot.message_handler(func=lambda m: m.text == BTN_STAFF_VERIFY)
 def handle_staff_verify(message):
     if not is_staff(message.from_user.id):
@@ -588,14 +590,17 @@ def handle_text_general(message):
     uid = message.from_user.id
     state = STATE.get(uid)
 
-    # Ввод месяца для статистики (после кнопки «📆 Выбрать месяц»)
+    # Ввод месяца после «📆 Выбрать месяц»
     if state == "await_month_pick":
         txt = (message.text or "").strip()
         try:
             y, m = txt.split("-")
             year, month = int(y), int(m)
             STATE.pop(uid, None)
-            send_month_stats(message.chat.id, year, month)
+            start_dt, end_dt = month_bounds(year, month)
+            subs, unsubs = aggregate_by_source(period=(start_dt, end_dt))
+            text = format_stats_by_source(f"Подписки по источникам — {year}-{str(month).zfill(2)}", subs, unsubs)
+            bot.reply_to(message, text)
             return
         except Exception:
             bot.reply_to(message, "Неверный формат. Введите месяц как <b>YYYY-MM</b>, например <code>2025-08</code>.", parse_mode="HTML")
