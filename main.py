@@ -9,9 +9,16 @@ SBALO Promo Bot — версия для Render (webhook с fallback на polling
 - Сотрудники могут смотреть статистику
 - Скидка по умолчанию 5%
 - Сотрудники МОГУТ добавлять новых сотрудников
+
+Надёжность Google Sheets:
+- GS_LOCK: синхронизация конкурентных доступов
+- Ретраи для append_row/update_cell/find/row_values/get_all_records
+- В issue_code: сначала гарантированная запись + верификация через find, затем ответ пользователю
+- В redeem_code: точечный поиск кода вместо полного скана
 """
 
-import os, random, string, calendar
+import os, random, string, calendar, threading
+from time import sleep
 from datetime import datetime
 from typing import Dict, Set, List, Tuple, Optional
 
@@ -51,17 +58,54 @@ SCOPES = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/a
 creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, SCOPES)
 client = gspread.authorize(creds)
 
+# Глобальный lock для всех операций с таблицей
+GS_LOCK = threading.Lock()
+
+# Универсальные безопасные обёртки с ретраями
+def _with_retries(fn, *args, retries=3, backoff=0.7, **kwargs):
+    last_err = None
+    for i in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if i == retries - 1:
+                raise
+            sleep(backoff * (2 ** i))
+    if last_err:
+        raise last_err
+
+def gs_append_row_safe(ws, row: list):
+    with GS_LOCK:
+        return _with_retries(ws.append_row, row)
+
+def gs_update_cell_safe(ws, r: int, c: int, value: str):
+    with GS_LOCK:
+        return _with_retries(ws.update_cell, r, c, value)
+
+def gs_get_all_records_safe(ws):
+    with GS_LOCK:
+        return _with_retries(ws.get_all_records)
+
+def gs_find_safe(ws, query: str):
+    with GS_LOCK:
+        return _with_retries(ws.find, query)
+
+def gs_row_values_safe(ws, row: int):
+    with GS_LOCK:
+        return _with_retries(ws.row_values, row)
+
 # Основной лист
 sheet = client.open_by_key(SPREADSHEET_ID).sheet1
 HEADERS = ["UserID","Username","PromoCode","DateIssued","DateRedeemed","RedeemedBy","OrderID","Source","SubscribedSince","Discount","UnsubscribedAt"]
-headers = sheet.row_values(1)
+headers = gs_row_values_safe(sheet, 1)
 if not headers:
-    sheet.append_row(HEADERS)
+    gs_append_row_safe(sheet, HEADERS)
     headers = HEADERS[:]
 else:
     for h in HEADERS:
         if h not in headers:
-            sheet.update_cell(1, len(headers) + 1, h)
+            gs_update_cell_safe(sheet, 1, len(headers) + 1, h)
             headers.append(h)
 
 # Лист отзывов
@@ -69,7 +113,7 @@ try:
     feedback_ws = client.open_by_key(SPREADSHEET_ID).worksheet("Feedback")
 except gspread.WorksheetNotFound:
     feedback_ws = client.open_by_key(SPREADSHEET_ID).add_worksheet(title="Feedback", rows=2000, cols=6)
-    feedback_ws.append_row(["UserID","Username","Rating","Text","Photos","Date"])
+    gs_append_row_safe(feedback_ws, ["UserID","Username","Rating","Text","Photos","Date"])
 
 # ---------- Telegram ----------
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
@@ -146,18 +190,20 @@ BRAND_ABOUT = (
 
 # ---------- Sheets утилиты ----------
 def append_row_dict(ws, header_list: List[str], data: dict):
-    headers_now = ws.row_values(1)
+    headers_now = gs_row_values_safe(ws, 1)
     if not headers_now:
-        ws.append_row(header_list)
+        gs_append_row_safe(ws, header_list)
         headers_now = header_list[:]
     row = [""] * len(headers_now)
     for k, v in data.items():
         if k in headers_now:
             row[headers_now.index(k)] = str(v)
-    ws.append_row(row)
+    gs_append_row_safe(ws, row)
 
 def get_row_by_user(user_id: int) -> Tuple[Optional[int], Optional[dict]]:
-    for i, rec in enumerate(sheet.get_all_records(), start=2):
+    # Используем безопасное чтение всего набора (оставлено как было)
+    records = gs_get_all_records_safe(sheet)
+    for i, rec in enumerate(records, start=2):
         if str(rec.get("UserID")) == str(user_id):
             return i, rec
     return None, None
@@ -169,9 +215,9 @@ def find_user_code(user_id: int) -> Tuple[Optional[int], Optional[str]]:
     return None, None
 
 def ensure_column(name: str):
-    hdrs = sheet.row_values(1)
+    hdrs = gs_row_values_safe(sheet, 1)
     if name not in hdrs:
-        sheet.update_cell(1, len(hdrs) + 1, name)
+        gs_update_cell_safe(sheet, 1, len(hdrs) + 1, name)
 
 # ---------- Промо/подписка ----------
 def generate_short_code() -> str:
@@ -192,8 +238,8 @@ def ensure_subscribed_since(user_id: int) -> datetime:
         except Exception:
             pass
     if i:
-        col = sheet.row_values(1).index("SubscribedSince") + 1
-        sheet.update_cell(i, col, now)
+        col = gs_row_values_safe(sheet, 1).index("SubscribedSince") + 1
+        gs_update_cell_safe(sheet, i, col, now)
     else:
         append_row_dict(sheet, HEADERS, {
             "UserID": str(user_id),
@@ -209,11 +255,22 @@ def can_issue(user_id: int) -> bool:
     return (datetime.now() - since).days >= SUBSCRIPTION_MIN_DAYS
 
 def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[str, bool]:
+    """
+    Надёжная выдача:
+    - Проверяем, что у пользователя ещё нет кода
+    - Генерируем код
+    - Пишем в таблицу (с ретраями, под lock)
+    - Верифицируем появление кода через find()
+    - Только после этого возвращаем код для отправки пользователю
+    """
     _, existing = find_user_code(user_id)
     if existing:
         return existing, False
+
     code = generate_short_code()
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
+
+    # 1) Записываем строку в таблицу
     append_row_dict(sheet, HEADERS, {
         "UserID": str(user_id),
         "Username": username or "",
@@ -225,37 +282,61 @@ def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[
         "SubscribedSince": "",
         "Discount": DISCOUNT_LABEL,  # 5% по умолчанию
     })
+
+    # 2) Верифицируем, что код реально появился (быстрым точечным поиском)
+    try:
+        cell = gs_find_safe(sheet, code)  # бросит исключение, если не найден
+        if not cell:
+            raise ValueError("Code not found after append")
+    except Exception as e:
+        # Если не получилось подтвердить запись — лучше бросить исключение
+        # В месте вызова мы перехватим и сообщим пользователю/админу
+        raise e
+
     return code, True
 
 def redeem_code(code: str, staff_username: str) -> Tuple[bool, str]:
-    for i, rec in enumerate(sheet.get_all_records(), start=2):
-        if rec.get("PromoCode") == code:
-            if rec.get("DateRedeemed"):
-                return False, (
-                    "❌ Код уже погашен ранее.\n"
-                    f"Скидка: {rec.get('Discount', '')}\n"
-                    f"Дата выдачи: {rec.get('DateIssued', '')}\n"
-                    f"Дата погашения: {rec.get('DateRedeemed', '')}\n"
-                    f"Погасил: {rec.get('RedeemedBy', '')}\n"
-                )
-            now = datetime.now().isoformat(sep=" ", timespec="seconds")
-            headers_now = sheet.row_values(1)
-            idx = {h: headers_now.index(h) for h in headers_now if h in headers_now}
-            sheet.update_cell(i, idx["DateRedeemed"] + 1, now)
-            sheet.update_cell(i, idx["RedeemedBy"] + 1, staff_username or "Staff")
-            discount = rec.get("Discount", DISCOUNT_LABEL)
-            issued = rec.get("DateIssued", "")
-            source = rec.get("Source", "")
-            reply = (
-                "✅ Код действителен и помечен как использованный.\n\n"
-                f"Код: <b>{code}</b>\n"
-                f"Скидка: <b>{discount}</b>\n"
-                f"Выдан: {issued}\n"
-                f"Источник: {source}\n"
-                f"Сотрудник: @{staff_username if staff_username else 'Staff'}"
-            )
-            return True, reply
-    return False, "Промокод не найден ❌"
+    # Ищем только нужный код (вместо полного сканирования)
+    try:
+        cell = gs_find_safe(sheet, code)
+    except Exception:
+        return False, "Промокод не найден ❌"
+
+    if not cell:
+        return False, "Промокод не найден ❌"
+
+    row_idx = cell.row
+    headers_now = gs_row_values_safe(sheet, 1)
+    recs = gs_get_all_records_safe(sheet)
+    rec = recs[row_idx - 2] if row_idx >= 2 and (row_idx - 2) < len(recs) else {}
+
+    if rec.get("DateRedeemed"):
+        return False, (
+            "❌ Код уже погашен ранее.\n"
+            f"Скидка: {rec.get('Discount', '')}\n"
+            f"Дата выдачи: {rec.get('DateIssued', '')}\n"
+            f"Дата погашения: {rec.get('DateRedeemed', '')}\n"
+            f"Погасил: {rec.get('RedeemedBy', '')}\n"
+        )
+
+    idx = {h: headers_now.index(h) for h in headers_now if h in headers_now}
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    gs_update_cell_safe(sheet, row_idx, idx["DateRedeemed"] + 1, now)
+    gs_update_cell_safe(sheet, row_idx, idx["RedeemedBy"] + 1, staff_username or "Staff")
+
+    discount = rec.get("Discount", DISCOUNT_LABEL)
+    issued = rec.get("DateIssued", "")
+    source = rec.get("Source", "")
+
+    reply = (
+        "✅ Код действителен и помечен как использованный.\n\n"
+        f"Код: <b>{code}</b>\n"
+        f"Скидка: <b>{discount}</b>\n"
+        f"Выдан: {issued}\n"
+        f"Источник: {source}\n"
+        f"Сотрудник: @{staff_username if staff_username else 'Staff'}"
+    )
+    return True, reply
 
 def is_subscribed(user_id: int) -> bool:
     try:
@@ -275,13 +356,24 @@ def do_check_subscription(chat_id: int, user):
     if not can_issue(user.id):
         bot.send_message(chat_id, "Спасибо за подписку! Промокод станет доступен позже.")
         return
+
     src = USER_SOURCE.get(user.id, "subscribe")
-    code, _ = issue_code(user.id, user.username, source=src)
-    bot.send_message(
-        chat_id,
-        f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
-        parse_mode="HTML"
-    )
+    try:
+        code, _ = issue_code(user.id, user.username, source=src)
+        bot.send_message(
+            chat_id,
+            f"Спасибо за подписку на {CHANNEL_USERNAME}! 🎉\nТвой промокод: <b>{code}</b>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        # Сообщим админу(ам) о проблеме записи
+        alert = f"⚠️ Не удалось записать промокод в таблицу для user {user.id} (@{user.username}). Ошибка: {e}"
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(admin_id, alert)
+            except Exception:
+                pass
+        bot.send_message(chat_id, "Сервис временно недоступен. Попробуйте ещё раз чуть позже 🙏")
 
 # ---------- Статистика ----------
 def parse_iso(dt_str: str) -> Optional[datetime]:
@@ -308,11 +400,11 @@ def ensure_unsubscribed_col():
 def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
     """Проставляет UnsubscribedAt тем, кто вышел из канала. Вызывать /subs_refresh (только админ)."""
     ensure_unsubscribed_col()
-    hdrs = sheet.row_values(1)
+    hdrs = gs_row_values_safe(sheet, 1)
     idx = {h: hdrs.index(h) for h in hdrs}
     updated = 0
     checked = 0
-    records = sheet.get_all_records()
+    records = gs_get_all_records_safe(sheet)
     for i, rec in enumerate(records, start=2):
         if max_checks is not None and checked >= max_checks:
             break
@@ -329,7 +421,7 @@ def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
             m = bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=uid)
             if m.status in ("left", "kicked"):
                 now = datetime.now().isoformat(sep=" ", timespec="seconds")
-                sheet.update_cell(i, idx["UnsubscribedAt"] + 1, now)
+                gs_update_cell_safe(sheet, i, idx["UnsubscribedAt"] + 1, now)
                 updated += 1
         except Exception:
             pass
@@ -339,7 +431,7 @@ def aggregate_by_source(period: Optional[Tuple[datetime, datetime]] = None) -> T
     """Возвращает (subs_by_source, unsubs_by_source) за период (или all-time)."""
     subs: Dict[str, int] = {}
     unsubs: Dict[str, int] = {}
-    records = sheet.get_all_records()
+    records = gs_get_all_records_safe(sheet)
     for rec in records:
         src = (rec.get("Source") or "default").strip() or "default"
 
@@ -566,7 +658,7 @@ def handle_feedback_submit_buttons(message):
     if STATE.get(uid) != "await_feedback_photos":
         return
     draft = FEEDBACK_DRAFT.get(uid, {})
-    feedback_ws.append_row([
+    gs_append_row_safe(feedback_ws, [
         str(uid),
         message.from_user.username or "",
         str(draft.get("rating")),
