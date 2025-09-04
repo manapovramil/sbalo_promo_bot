@@ -15,9 +15,16 @@ SBALO Promo Bot — версия для Render (webhook с fallback на polling
 - Ретраи для append_row/update_cell/find/row_values/get_all_records
 - В issue_code: сначала гарантированная запись + верификация через find, затем ответ пользователю
 - В redeem_code: точечный поиск кода вместо полного скана
+
+Новые правки:
+- При нажатии «Подписаться» запускаются авто-проверки членства (20с, 2мин, 10мин). Как только пользователь реально вступил в канал —
+  без каких-либо сообщений пользователю автоматически создается и записывается промокод (если ещё не был создан).
+- Текст второй инлайн-кнопки заменён на «🎁Получить промокод» (callback: check_and_issue).
+- Фиксируем факт клика «Подписаться» в колонку SubscribeClickedAt.
 """
 
 import os, random, string, calendar, threading
+from threading import Timer
 from time import sleep
 from datetime import datetime
 from typing import Dict, Set, List, Tuple, Optional
@@ -32,10 +39,13 @@ from oauth2client.service_account import ServiceAccountCredentials
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "")  # например: @sbalo_channel
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
+
 # STAFF_IDS — сотрудники (могут гасить коды, смотреть статистику, добавлять сотрудников)
 STAFF_IDS: Set[int] = set(int(x) for x in os.getenv("STAFF_IDS", "").split(",") if x.strip().isdigit())
+
 # ADMIN_IDS — список админов (имеют полный доступ, включая /subs_refresh)
 ADMIN_IDS: List[int] = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+
 SUBSCRIPTION_MIN_DAYS = int(os.getenv("SUBSCRIPTION_MIN_DAYS", "0"))
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
 DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "5%")  # 5% по умолчанию
@@ -97,7 +107,7 @@ def gs_row_values_safe(ws, row: int):
 
 # Основной лист
 sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-HEADERS = ["UserID","Username","PromoCode","DateIssued","DateRedeemed","RedeemedBy","OrderID","Source","SubscribedSince","Discount","UnsubscribedAt"]
+HEADERS = ["UserID","Username","PromoCode","DateIssued","DateRedeemed","RedeemedBy","OrderID","Source","SubscribedSince","Discount","UnsubscribedAt","SubscribeClickedAt"]
 headers = gs_row_values_safe(sheet, 1)
 if not headers:
     gs_append_row_safe(sheet, HEADERS)
@@ -122,6 +132,9 @@ STATE: Dict[int, str] = {}
 USER_SOURCE: Dict[int, str] = {}
 FEEDBACK_DRAFT: Dict[int, Dict] = {}
 
+# Для авто-проверок членства после нажатия «Подписаться»
+PENDING_SUB: Dict[int, Dict] = {}
+
 # ---------- Кнопки ----------
 BTN_ABOUT = "ℹ️ О бренде"
 BTN_FEEDBACK = "📝 Оставить отзыв"
@@ -138,6 +151,7 @@ def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 def is_staff(uid: int) -> bool:
+    # админ считается сотрудником по правам
     return uid in STAFF_IDS or is_admin(uid)
 
 def add_staff_id(new_id: int) -> None:
@@ -169,8 +183,10 @@ def photos_keyboard():
 
 def inline_subscribe_keyboard():
     ikb = telebot.types.InlineKeyboardMarkup()
-    ikb.add(telebot.types.InlineKeyboardButton("✅ Подписаться на канал", url=f"https://t.me/{CHANNEL_USERNAME.lstrip('@')}"))
-    ikb.add(telebot.types.InlineKeyboardButton("🎁 Проверить подписку и получить промокод", callback_data="check_and_issue"))
+    # 1) callback: фиксируем клик, шлём ссылку, запускаем авто-проверки
+    ikb.add(telebot.types.InlineKeyboardButton("✅ Подписаться на канал", callback_data="want_subscribe"))
+    # 2) получение кода (как раньше), только текст изменён
+    ikb.add(telebot.types.InlineKeyboardButton("🎁Получить промокод", callback_data="check_and_issue"))
     return ikb
 
 # ---------- Тексты ----------
@@ -201,7 +217,6 @@ def append_row_dict(ws, header_list: List[str], data: dict):
     gs_append_row_safe(ws, row)
 
 def get_row_by_user(user_id: int) -> Tuple[Optional[int], Optional[dict]]:
-    # Используем безопасное чтение всего набора (оставлено как было)
     records = gs_get_all_records_safe(sheet)
     for i, rec in enumerate(records, start=2):
         if str(rec.get("UserID")) == str(user_id):
@@ -261,7 +276,7 @@ def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[
     - Генерируем код
     - Пишем в таблицу (с ретраями, под lock)
     - Верифицируем появление кода через find()
-    - Только после этого возвращаем код для отправки пользователю
+    - Только после этого возвращаем код
     """
     _, existing = find_user_code(user_id)
     if existing:
@@ -283,20 +298,17 @@ def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[
         "Discount": DISCOUNT_LABEL,  # 5% по умолчанию
     })
 
-    # 2) Верифицируем, что код реально появился (быстрым точечным поиском)
+    # 2) Верифицируем, что код появился
     try:
-        cell = gs_find_safe(sheet, code)  # бросит исключение, если не найден
+        cell = gs_find_safe(sheet, code)
         if not cell:
             raise ValueError("Code not found after append")
     except Exception as e:
-        # Если не получилось подтвердить запись — лучше бросить исключение
-        # В месте вызова мы перехватим и сообщим пользователю/админу
         raise e
 
     return code, True
 
 def redeem_code(code: str, staff_username: str) -> Tuple[bool, str]:
-    # Ищем только нужный код (вместо полного сканирования)
     try:
         cell = gs_find_safe(sheet, code)
     except Exception:
@@ -345,6 +357,108 @@ def is_subscribed(user_id: int) -> bool:
     except Exception:
         return False
 
+# ---------- Логика «Подписаться» с авто-созданием кода ----------
+def mark_subscribe_click(user_id: int, username: str):
+    ensure_column("SubscribeClickedAt")
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    i, rec = get_row_by_user(user_id)
+    if i:
+        hdrs = gs_row_values_safe(sheet, 1)
+        col = hdrs.index("SubscribeClickedAt") + 1
+        gs_update_cell_safe(sheet, i, col, now)
+    else:
+        append_row_dict(sheet, HEADERS, {
+            "UserID": str(user_id),
+            "Username": username or "",
+            "Source": "subscribe_click",
+            "SubscribeClickedAt": now
+        })
+
+def schedule_membership_checks(user_id: int, chat_id: int):
+    """
+    Планировщик проверки членства: 20s, 2min, 10min.
+    При первом подтверждении подписки:
+      - проставляем SubscribedSince (если пусто)
+      - создаём и записываем промокод (если ещё нет)
+      - пользователю ничего не пишем
+    """
+    delays = [20, 120, 600]
+    PENDING_SUB[user_id] = {"chat_id": chat_id, "t0": datetime.now()}
+
+    def _check():
+        # если код уже создан — дальнейшие проверки не нужны
+        _, existing_code = find_user_code(user_id)
+        if existing_code:
+            PENDING_SUB.pop(user_id, None)
+            return
+
+        if is_subscribed(user_id):
+            # 1) фиксируем дату подписки
+            ensure_subscribed_since(user_id)
+            # 2) создаём и записываем промокод без сообщения пользователю
+            try:
+                issue_code(user_id, "", source="auto_issue")
+            except Exception as e:
+                # тихо уведомим админов, чтобы не потерять кейс
+                for admin_id in ADMIN_IDS:
+                    try:
+                        bot.send_message(admin_id, f"⚠️ Auto-issue fail для {user_id}: {e}")
+                    except Exception:
+                        pass
+            # 3) стопим дальнейшие проверки
+            PENDING_SUB.pop(user_id, None)
+
+    for d in delays:
+        Timer(d, _check).start()
+
+# ---------- Хендлеры: старт/промокод/о бренде ----------
+@bot.message_handler(commands=["start", "help"])
+def start(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        USER_SOURCE[message.from_user.id] = parts[1].strip()[:32].lower()
+    bot.send_message(message.chat.id, WELCOME, reply_markup=make_main_keyboard(message.from_user.id))
+    bot.send_message(message.chat.id, "Хочешь промокод? Нажми кнопку ниже 👇", reply_markup=inline_subscribe_keyboard())
+
+@bot.callback_query_handler(func=lambda c: c.data == "check_and_issue")
+def cb_check_and_issue(cb):
+    do_check_subscription(cb.message.chat.id, cb.from_user)
+    try:
+        bot.answer_callback_query(cb.id)
+    except Exception:
+        pass
+
+@bot.callback_query_handler(func=lambda c: c.data == "want_subscribe")
+def cb_want_subscribe(cb):
+    u = cb.from_user
+    chat_id = cb.message.chat.id
+
+    # 1) лог клика
+    try:
+        mark_subscribe_click(u.id, u.username or "")
+    except Exception as e:
+        print("mark_subscribe_click error:", e)
+
+    # 2) отправляем ссылку на канал
+    try:
+        bot.send_message(
+            chat_id,
+            f"Открой наш канал и подпишись: https://t.me/{CHANNEL_USERNAME.lstrip('@')}"
+        )
+    except Exception:
+        pass
+
+    # 3) запускаем авто-проверки (при вступлении — автоматически создадим/запишем промокод)
+    try:
+        schedule_membership_checks(u.id, chat_id)
+    except Exception as e:
+        print("schedule_membership_checks error:", e)
+
+    try:
+        bot.answer_callback_query(cb.id)
+    except Exception:
+        pass
+
 def do_check_subscription(chat_id: int, user):
     if not is_subscribed(user.id):
         bot.send_message(
@@ -374,6 +488,10 @@ def do_check_subscription(chat_id: int, user):
             except Exception:
                 pass
         bot.send_message(chat_id, "Сервис временно недоступен. Попробуйте ещё раз чуть позже 🙏")
+
+@bot.message_handler(func=lambda m: m.text == BTN_ABOUT)
+def handle_about(message):
+    bot.reply_to(message, BRAND_ABOUT, parse_mode="HTML")
 
 # ---------- Статистика ----------
 def parse_iso(dt_str: str) -> Optional[datetime]:
@@ -477,27 +595,6 @@ def send_subs_menu(chat_id: int):
         telebot.types.InlineKeyboardButton("∞ Всё время", callback_data=CB_SUBS_MENU_ALL),
     )
     bot.send_message(chat_id, "Выберите период для статистики:", reply_markup=kb)
-
-# ---------- Хендлеры: старт/промокод/о бренде ----------
-@bot.message_handler(commands=["start", "help"])
-def start(message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) > 1 and parts[1].strip():
-        USER_SOURCE[message.from_user.id] = parts[1].strip()[:32].lower()
-    bot.send_message(message.chat.id, WELCOME, reply_markup=make_main_keyboard(message.from_user.id))
-    bot.send_message(message.chat.id, "Хочешь промокод? Нажми кнопку ниже 👇", reply_markup=inline_subscribe_keyboard())
-
-@bot.callback_query_handler(func=lambda c: c.data == "check_and_issue")
-def cb_check_and_issue(cb):
-    do_check_subscription(cb.message.chat.id, cb.from_user)
-    try:
-        bot.answer_callback_query(cb.id)
-    except Exception:
-        pass
-
-@bot.message_handler(func=lambda m: m.text == BTN_ABOUT)
-def handle_about(message):
-    bot.reply_to(message, BRAND_ABOUT, parse_mode="HTML")
 
 # ---------- Статистика (меню/команды) ----------
 @bot.message_handler(func=lambda m: m.text == BTN_STATS_MENU)
