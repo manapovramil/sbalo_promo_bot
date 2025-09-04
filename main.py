@@ -1,26 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-SBALO Promo Bot — версия для Render (webhook с fallback на polling)
+SBALO Promo Bot — Render (webhook с fallback на polling)
 
-Функции:
-- Несколько админов через ENV ADMIN_IDS=123,456,789
-- Кнопка «📊 Статистика» в основном меню (для админа(ов) и сотрудников)
-- Статистика подписок/отписок по источникам (месяц/всё время), инлайн-меню
-- Сотрудники могут смотреть статистику
-- Скидка по умолчанию 5%
-- Сотрудники МОГУТ добавлять новых сотрудников
-
-Надёжность Google Sheets:
-- GS_LOCK: синхронизация конкурентных доступов
-- Ретраи для append_row/update_cell/find/row_values/get_all_records
-- В issue_code: сначала гарантированная запись + верификация через find, затем ответ пользователю
-- В redeem_code: точечный поиск кода вместо полного скана
-
-Новые правки:
-- При нажатии «Подписаться» запускаются авто-проверки членства (20с, 2мин, 10мин). Как только пользователь реально вступил в канал —
-  без каких-либо сообщений пользователю автоматически создается и записывается промокод (если ещё не был создан).
-- Текст второй инлайн-кнопки заменён на «🎁Получить промокод» (callback: check_and_issue).
-- Фиксируем факт клика «Подписаться» в колонку SubscribeClickedAt.
+Ключевые функции:
+- Главные кнопки: «О бренде», «Оставить отзыв», для сотрудников — «Проверить/Погасить код», «Статистика», «Добавить сотрудника»
+- Статистика подписок/отписок по источникам (месяц/всё время)
+- Надёжная запись в Google Sheets (lock + retries)
+- Промокод 1 на пользователя (upsert в строку)
+- Автовыдача промокода после фактической подписки (без сообщений пользователю)
+- Фиксация источника из /start-параметра в Source сразу при клике «Подписаться»
 """
 
 import os, random, string, calendar, threading
@@ -43,12 +31,12 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
 # STAFF_IDS — сотрудники (могут гасить коды, смотреть статистику, добавлять сотрудников)
 STAFF_IDS: Set[int] = set(int(x) for x in os.getenv("STAFF_IDS", "").split(",") if x.strip().isdigit())
 
-# ADMIN_IDS — список админов (имеют полный доступ, включая /subs_refresh)
+# ADMIN_IDS — админы (полный доступ, включая /subs_refresh)
 ADMIN_IDS: List[int] = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
 SUBSCRIPTION_MIN_DAYS = int(os.getenv("SUBSCRIPTION_MIN_DAYS", "0"))
 SERVICE_ACCOUNT_JSON = os.getenv("SERVICE_ACCOUNT_JSON", "").strip()
-DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "5%")  # 5% по умолчанию
+DISCOUNT_LABEL = os.getenv("DISCOUNT_LABEL", "5%")  # скидка по умолчанию
 
 if not SERVICE_ACCOUNT_JSON:
     raise SystemExit("ENV SERVICE_ACCOUNT_JSON пуст — вставьте содержимое credentials.json в переменную окружения.")
@@ -105,9 +93,23 @@ def gs_row_values_safe(ws, row: int):
     with GS_LOCK:
         return _with_retries(ws.row_values, row)
 
+def get_col_map(ws) -> dict:
+    hdrs = gs_row_values_safe(ws, 1)
+    return {h: i + 1 for i, h in enumerate(hdrs)}
+
+def update_row_fields(ws, row_idx: int, fields: dict):
+    colmap = get_col_map(ws)
+    for k, v in fields.items():
+        if k in colmap:
+            gs_update_cell_safe(ws, row_idx, colmap[k], "" if v is None else str(v))
+
 # Основной лист
 sheet = client.open_by_key(SPREADSHEET_ID).sheet1
-HEADERS = ["UserID","Username","PromoCode","DateIssued","DateRedeemed","RedeemedBy","OrderID","Source","SubscribedSince","Discount","UnsubscribedAt","SubscribeClickedAt"]
+HEADERS = [
+    "UserID","Username","PromoCode","DateIssued","DateRedeemed","RedeemedBy",
+    "OrderID","Source","SubscribedSince","Discount","UnsubscribedAt",
+    "SubscribeClickedAt","AutoIssuedAt"
+]
 headers = gs_row_values_safe(sheet, 1)
 if not headers:
     gs_append_row_safe(sheet, HEADERS)
@@ -129,7 +131,7 @@ except gspread.WorksheetNotFound:
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 STATE: Dict[int, str] = {}
-USER_SOURCE: Dict[int, str] = {}
+USER_SOURCE: Dict[int, str] = {}   # фиксируем utm/источник из /start
 FEEDBACK_DRAFT: Dict[int, Dict] = {}
 
 # Для авто-проверок членства после нажатия «Подписаться»
@@ -151,12 +153,10 @@ def is_admin(uid: int) -> bool:
     return uid in ADMIN_IDS
 
 def is_staff(uid: int) -> bool:
-    # админ считается сотрудником по правам
     return uid in STAFF_IDS or is_admin(uid)
 
 def add_staff_id(new_id: int) -> None:
     STAFF_IDS.add(new_id)
-    # Обновим ENV в рантайме (для текущего процесса), в Render ENV менять вручную
     os.environ["STAFF_IDS"] = ",".join(str(x) for x in sorted(STAFF_IDS))
 
 # ---------- Клавиатуры ----------
@@ -183,9 +183,7 @@ def photos_keyboard():
 
 def inline_subscribe_keyboard():
     ikb = telebot.types.InlineKeyboardMarkup()
-    # 1) callback: фиксируем клик, шлём ссылку, запускаем авто-проверки
     ikb.add(telebot.types.InlineKeyboardButton("✅ Подписаться на канал", callback_data="want_subscribe"))
-    # 2) получение кода (как раньше), только текст изменён
     ikb.add(telebot.types.InlineKeyboardButton("🎁Получить промокод", callback_data="check_and_issue"))
     return ikb
 
@@ -271,42 +269,52 @@ def can_issue(user_id: int) -> bool:
 
 def issue_code(user_id: int, username: str, source: str = "subscribe") -> Tuple[str, bool]:
     """
-    Надёжная выдача:
-    - Проверяем, что у пользователя ещё нет кода
-    - Генерируем код
-    - Пишем в таблицу (с ретраями, под lock)
-    - Верифицируем появление кода через find()
-    - Только после этого возвращаем код
+    UPsert: гарантируем 1 код и 1 строку на пользователя.
+    - Если код уже есть — возвращаем его (created=False).
+    - Если строки нет — создаём новую.
+    - Если строка есть — обновляем её полями PromoCode/DateIssued/Discount.
+      Source заполняем только если пуст (чтобы не перетирать UTM из /start).
+    Возвращает: (code, created_bool)
     """
-    _, existing = find_user_code(user_id)
-    if existing:
-        return existing, False
+    row_idx, rec = get_row_by_user(user_id)
+    if row_idx and rec and rec.get("PromoCode"):
+        return rec["PromoCode"], False
 
-    code = generate_short_code()
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    code = generate_short_code()
 
-    # 1) Записываем строку в таблицу
-    append_row_dict(sheet, HEADERS, {
-        "UserID": str(user_id),
-        "Username": username or "",
-        "PromoCode": code,
-        "DateIssued": now,
-        "DateRedeemed": "",
-        "RedeemedBy": "",
-        "Source": source,
-        "SubscribedSince": "",
-        "Discount": DISCOUNT_LABEL,  # 5% по умолчанию
-    })
+    if row_idx:
+        fields = {
+            "Username": username or rec.get("Username") or "",
+            "PromoCode": code,
+            "DateIssued": now,
+            "Discount": DISCOUNT_LABEL,
+        }
+        if not rec.get("Source"):
+            fields["Source"] = source
+        if source == "auto_issue" and not rec.get("AutoIssuedAt"):
+            fields["AutoIssuedAt"] = now
+        update_row_fields(sheet, row_idx, fields)
+    else:
+        append_row_dict(sheet, HEADERS, {
+            "UserID": str(user_id),
+            "Username": username or "",
+            "PromoCode": code,
+            "DateIssued": now,
+            "DateRedeemed": "",
+            "RedeemedBy": "",
+            "Source": source,
+            "SubscribedSince": "",
+            "Discount": DISCOUNT_LABEL,
+            "AutoIssuedAt": now if source == "auto_issue" else "",
+        })
 
-    # 2) Верифицируем, что код появился
-    try:
-        cell = gs_find_safe(sheet, code)
-        if not cell:
-            raise ValueError("Code not found after append")
-    except Exception as e:
-        raise e
+    # Верифицируем по user_id (независимо от append/update)
+    row_idx2, rec2 = get_row_by_user(user_id)
+    if not row_idx2 or not rec2 or not rec2.get("PromoCode"):
+        raise RuntimeError("Code not persisted for user")
 
-    return code, True
+    return rec2["PromoCode"], True
 
 def redeem_code(code: str, staff_username: str) -> Tuple[bool, str]:
     try:
@@ -357,61 +365,59 @@ def is_subscribed(user_id: int) -> bool:
     except Exception:
         return False
 
-# ---------- Логика «Подписаться» с авто-созданием кода ----------
+# ---------- Логика «Подписаться» с источником и авто-выдачей кода ----------
 def mark_subscribe_click(user_id: int, username: str):
     ensure_column("SubscribeClickedAt")
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    src = USER_SOURCE.get(user_id, "direct")
+
     i, rec = get_row_by_user(user_id)
     if i:
         hdrs = gs_row_values_safe(sheet, 1)
         col = hdrs.index("SubscribeClickedAt") + 1
         gs_update_cell_safe(sheet, i, col, now)
+        if not rec.get("Source"):  # не перетираем уже заданный источник
+            col_src = hdrs.index("Source") + 1
+            gs_update_cell_safe(sheet, i, col_src, src)
     else:
         append_row_dict(sheet, HEADERS, {
             "UserID": str(user_id),
             "Username": username or "",
-            "Source": "subscribe_click",
+            "Source": src,
             "SubscribeClickedAt": now
         })
 
 def schedule_membership_checks(user_id: int, chat_id: int):
     """
-    Планировщик проверки членства: 20s, 2min, 10min.
+    Проверки членства: 20s, 2min, 10min.
     При первом подтверждении подписки:
-      - проставляем SubscribedSince (если пусто)
-      - создаём и записываем промокод (если ещё нет)
+      - SubscribedSince (если пусто)
+      - issue_code(..., source="auto_issue") — апдейт в ту же строку
       - пользователю ничего не пишем
     """
     delays = [20, 120, 600]
     PENDING_SUB[user_id] = {"chat_id": chat_id, "t0": datetime.now()}
 
     def _check():
-        # если код уже создан — дальнейшие проверки не нужны
-        _, existing_code = find_user_code(user_id)
-        if existing_code:
+        _, rec = get_row_by_user(user_id)
+        if rec and rec.get("PromoCode"):
             PENDING_SUB.pop(user_id, None)
             return
 
         if is_subscribed(user_id):
-            # 1) фиксируем дату подписки
             ensure_subscribed_since(user_id)
-            # 2) создаём и записываем промокод без сообщения пользователю
             try:
                 issue_code(user_id, "", source="auto_issue")
             except Exception as e:
-                # тихо уведомим админов, чтобы не потерять кейс
                 for admin_id in ADMIN_IDS:
-                    try:
-                        bot.send_message(admin_id, f"⚠️ Auto-issue fail для {user_id}: {e}")
-                    except Exception:
-                        pass
-            # 3) стопим дальнейшие проверки
+                    try: bot.send_message(admin_id, f"⚠️ Auto-issue fail для {user_id}: {e}")
+                    except: pass
             PENDING_SUB.pop(user_id, None)
 
     for d in delays:
         Timer(d, _check).start()
 
-# ---------- Хендлеры: старт/промокод/о бренде ----------
+# ---------- Старт/кнопки ----------
 @bot.message_handler(commands=["start", "help"])
 def start(message):
     parts = message.text.split(maxsplit=1)
@@ -433,13 +439,14 @@ def cb_want_subscribe(cb):
     u = cb.from_user
     chat_id = cb.message.chat.id
 
-    # 1) лог клика
+    if u.id not in USER_SOURCE:
+        USER_SOURCE[u.id] = "direct"
+
     try:
         mark_subscribe_click(u.id, u.username or "")
     except Exception as e:
         print("mark_subscribe_click error:", e)
 
-    # 2) отправляем ссылку на канал
     try:
         bot.send_message(
             chat_id,
@@ -448,7 +455,6 @@ def cb_want_subscribe(cb):
     except Exception:
         pass
 
-    # 3) запускаем авто-проверки (при вступлении — автоматически создадим/запишем промокод)
     try:
         schedule_membership_checks(u.id, chat_id)
     except Exception as e:
@@ -480,13 +486,10 @@ def do_check_subscription(chat_id: int, user):
             parse_mode="HTML"
         )
     except Exception as e:
-        # Сообщим админу(ам) о проблеме записи
         alert = f"⚠️ Не удалось записать промокод в таблицу для user {user.id} (@{user.username}). Ошибка: {e}"
         for admin_id in ADMIN_IDS:
-            try:
-                bot.send_message(admin_id, alert)
-            except Exception:
-                pass
+            try: bot.send_message(admin_id, alert)
+            except Exception: pass
         bot.send_message(chat_id, "Сервис временно недоступен. Попробуйте ещё раз чуть позже 🙏")
 
 @bot.message_handler(func=lambda m: m.text == BTN_ABOUT)
@@ -509,14 +512,13 @@ def month_bounds(year: int, month: int) -> Tuple[datetime, datetime]:
     return start, end
 
 def get_subscribe_date(rec: dict) -> Optional[datetime]:
-    # Основной источник — SubscribedSince; если пусто — DateIssued как прокси
     return parse_iso(rec.get("SubscribedSince") or rec.get("DateIssued") or "")
 
 def ensure_unsubscribed_col():
     ensure_column("UnsubscribedAt")
 
 def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
-    """Проставляет UnsubscribedAt тем, кто вышел из канала. Вызывать /subs_refresh (только админ)."""
+    """Проставляет UnsubscribedAt тем, кто вышел из канала. Команда /subs_refresh (только админ)."""
     ensure_unsubscribed_col()
     hdrs = gs_row_values_safe(sheet, 1)
     idx = {h: hdrs.index(h) for h in hdrs}
@@ -546,17 +548,14 @@ def refresh_unsubs(max_checks: Optional[int] = None) -> Tuple[int, int]:
     return checked, updated
 
 def aggregate_by_source(period: Optional[Tuple[datetime, datetime]] = None) -> Tuple[Dict[str, int], Dict[str, int]]:
-    """Возвращает (subs_by_source, unsubs_by_source) за период (или all-time)."""
     subs: Dict[str, int] = {}
     unsubs: Dict[str, int] = {}
     records = gs_get_all_records_safe(sheet)
     for rec in records:
         src = (rec.get("Source") or "default").strip() or "default"
-
         sub_dt = get_subscribe_date(rec)
         if sub_dt and (period is None or (period[0] <= sub_dt <= period[1])):
             subs[src] = subs.get(src, 0) + 1
-
         unsub_dt = parse_iso(rec.get("UnsubscribedAt") or "")
         if unsub_dt and (period is None or (period[0] <= unsub_dt <= period[1])):
             unsubs[src] = unsubs.get(src, 0) + 1
@@ -637,11 +636,10 @@ def cmd_subs_month(message):
 
 @bot.message_handler(commands=["subs_refresh"])
 def cmd_subs_refresh(message):
-    # только админы обновляют статусы (API-лимит)
     if not is_admin(message.from_user.id):
         bot.reply_to(message, "Доступно только администратору.")
         return
-    max_checks = None  # можно поставить число (например, 500), чтобы ограничить проверку за вызов
+    max_checks = None
     checked, updated = refresh_unsubs(max_checks=max_checks)
     bot.reply_to(message, f"Проверено: {checked}, обновлено UnsubscribedAt: {updated}")
 
@@ -774,13 +772,12 @@ def handle_cancel(message):
     FEEDBACK_DRAFT.pop(uid, None)
     bot.reply_to(message, "Отменено.", reply_markup=make_main_keyboard(uid))
 
-# ---------- Общий обработчик ТЕКСТА (последним!) ----------
+# ---------- Общий обработчик ТЕКСТА ----------
 @bot.message_handler(content_types=["text"])
 def handle_text_general(message):
     uid = message.from_user.id
     state = STATE.get(uid)
 
-    # Ввод месяца после «📆 Выбрать месяц»
     if state == "await_month_pick":
         txt = (message.text or "").strip()
         try:
