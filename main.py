@@ -8,7 +8,7 @@ SBALO Promo Bot — Render (webhook с fallback на polling)
 - Надёжная запись в Google Sheets (lock + retries)
 - Промокод 1 на пользователя (upsert в строку)
 - Автовыдача промокода после фактической подписки (без сообщений пользователю)
-- Фиксация источника из /start-параметра в Source сразу при клике «Подписаться»
+- Фиксация источника из /start-параметра (или "direct" при клике «Подписаться»)
 """
 
 import os, random, string, calendar, threading
@@ -496,14 +496,35 @@ def do_check_subscription(chat_id: int, user):
 def handle_about(message):
     bot.reply_to(message, BRAND_ABOUT, parse_mode="HTML")
 
-# ---------- Статистика ----------
+# ---------- СТАТИСТИКА (фикс учёта дат) ----------
 def parse_iso(dt_str: str) -> Optional[datetime]:
     if not dt_str:
         return None
-    try:
-        return datetime.fromisoformat(dt_str)
-    except Exception:
-        return None
+    s = str(dt_str).strip()
+    # Попытки распарсить разные привычные варианты (некоторые строки имеют время без ведущего нуля и др.)
+    candidates = [
+        s,
+        s.replace("T", " "),
+        s.split(".")[0],              # срезать микросекунды
+        s.replace("/", "-"),
+    ]
+    fmts = [
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
+        "%d.%m.%Y %H:%M:%S", "%d.%m.%Y",
+        "%Y/%m/%d %H:%M:%S", "%Y/%m/%d",
+        "%Y-%m-%d %H:%M", "%Y-%m-%d %H",
+    ]
+    for c in candidates:
+        try:
+            return datetime.fromisoformat(c)
+        except Exception:
+            pass
+        for fmt in fmts:
+            try:
+                return datetime.strptime(c, fmt)
+            except Exception:
+                continue
+    return None
 
 def month_bounds(year: int, month: int) -> Tuple[datetime, datetime]:
     start = datetime(year, month, 1)
@@ -512,7 +533,12 @@ def month_bounds(year: int, month: int) -> Tuple[datetime, datetime]:
     return start, end
 
 def get_subscribe_date(rec: dict) -> Optional[datetime]:
-    return parse_iso(rec.get("SubscribedSince") or rec.get("DateIssued") or "")
+    # Приоритет: SubscribedSince → DateIssued → AutoIssuedAt → (fallback) SubscribeClickedAt
+    for key in ("SubscribedSince", "DateIssued", "AutoIssuedAt", "SubscribeClickedAt"):
+        dt = parse_iso(rec.get(key) or "")
+        if dt:
+            return dt
+    return None
 
 def ensure_unsubscribed_col():
     ensure_column("UnsubscribedAt")
