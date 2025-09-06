@@ -533,12 +533,11 @@ def month_bounds(year: int, month: int) -> Tuple[datetime, datetime]:
     return start, end
 
 def get_subscribe_date(rec: dict) -> Optional[datetime]:
-    # Приоритет: SubscribedSince → DateIssued → AutoIssuedAt → (fallback) SubscribeClickedAt
-    for key in ("SubscribedSince", "DateIssued", "AutoIssuedAt", "SubscribeClickedAt"):
-        dt = parse_iso(rec.get(key) or "")
-        if dt:
-            return dt
-    return None
+    # подписчиком считаем только тех, у кого есть выданный промокод
+    if not rec.get("PromoCode"):
+        return None
+    # дата подписки = дата выдачи кода (у нас она ставится в issue_code и при авто-выдаче)
+    return parse_iso(rec.get("DateIssued") or "")
 
 def ensure_unsubscribed_col():
     ensure_column("UnsubscribedAt")
@@ -578,13 +577,20 @@ def aggregate_by_source(period: Optional[Tuple[datetime, datetime]] = None) -> T
     unsubs: Dict[str, int] = {}
     records = gs_get_all_records_safe(sheet)
     for rec in records:
+        # считаем только записи с выданным кодом
+        if not rec.get("PromoCode"):
+            continue
+
         src = (rec.get("Source") or "default").strip() or "default"
-        sub_dt = get_subscribe_date(rec)
+
+        sub_dt = get_subscribe_date(rec)  # уже фильтрует по PromoCode
         if sub_dt and (period is None or (period[0] <= sub_dt <= period[1])):
             subs[src] = subs.get(src, 0) + 1
+
         unsub_dt = parse_iso(rec.get("UnsubscribedAt") or "")
         if unsub_dt and (period is None or (period[0] <= unsub_dt <= period[1])):
             unsubs[src] = unsubs.get(src, 0) + 1
+
     return subs, unsubs
 
 def format_stats_by_source(title: str, subs: Dict[str, int], unsubs: Dict[str, int]) -> str:
